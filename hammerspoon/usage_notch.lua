@@ -33,7 +33,9 @@ local function clamp(v, a, b) return math.max(a, math.min(b, v)) end
 local K = 0.5523
 local STEP = 62
 local COUNT = 4
-local H = 28 + STEP * (COUNT - 1) + 42  -- 256（2行ラベル込みで余白ゆったり）
+local GEAR_H = 20  -- 一番下の「•••」（表示するものを選ぶ）の段
+local function calcH(n) return 28 + STEP * (n - 1) + 42 + GEAR_H end
+local H = calcH(COUNT)
 local OPEN_W, REST_W = 54, 6
 local FILLET = 10
 local BLACK = { red = 0.04, green = 0.04, blue = 0.05, alpha = 1 }
@@ -67,6 +69,8 @@ local function placeholder(id, label)
   }
 end
 
+local rawItems = nil   -- 集計が返した全部（表示の選択をかける前）
+local applyPrefs       -- 下で定義
 local items = {
   placeholder("claude", "Claude"),
   placeholder("codex", "Codex"),
@@ -206,6 +210,11 @@ local function buttons(els, cx, top)
     local subCol = v.mode == "percent" and SUB_DIM or { red = 0.52, green = 0.72, blue = 0.92 }
     table.insert(els, subLabel(v.sub, cx, cy + 27, subCol))
   end
+  local gy = top + H - 14
+  table.insert(els, { id = "gear", type = "rectangle", frame = { x = cx - 22, y = gy - 10, w = 44, h = 20 }, action = "fill",
+    fillColor = { white = 1, alpha = 0.001 }, trackMouseEnterExit = true, trackMouseDown = true })
+  table.insert(els, { type = "text", text = hs.styledtext.new("•••", { font = { size = 9 }, color = SUB_DIM,
+    paragraphStyle = { alignment = "center" } }), frame = { x = cx - 22, y = gy - 7, w = 44, h = 14 } })
 end
 
 local function itemCy(id)
@@ -298,6 +307,10 @@ local function showTip(line1, line2, cy)
 end
 
 local function showTipForId(id)
+  if id == "gear" then
+    showTip(L("表示するものを選ぶ", "Choose what to show"), L("足す・消す・並べ替え（右クリックでも開く）", "Add, remove, reorder (or right-click)"), FILLET + H - 14)
+    return
+  end
   local cy, it = itemCy(id)
   if not it then return end
   local v = activeView(it)
@@ -334,15 +347,8 @@ local function refresh(force)
     if code == 0 and out and #out > 0 then
       local ok, data = pcall(hs.json.decode, out)
       if ok and type(data) == "table" and type(data.items) == "table" and #data.items > 0 then
-        -- 使っていない AI（present = false）の丸は出さない。丸の数に合わせて高さも変える
-        local shown = {}
-        for _, it in ipairs(data.items) do
-          if it.present ~= false then table.insert(shown, it) end
-        end
-        if #shown == 0 then shown = { data.items[1] } end
-        items = shown
-        COUNT = #items
-        H = 28 + STEP * (COUNT - 1) + 42
+        rawItems = data.items
+        applyPrefs()
       end
     end
     draw()
@@ -423,9 +429,186 @@ moveFloat = function()
   notch[1].frame = { x = (cw - w) / 2, y = (ch - h) / 2, w = w, h = h }
 end
 
--- クリック: そのAIの時間軸を次へ切替。option+クリックで今すぐ最新値に更新
+
+---------------------------------------------------------------- 表示するものを選ぶ（出す・出さない・時間の幅・並べ替え・自分の項目）
+-- 選んだ内容はこの Mac の Hammerspoon の設定（aiusage.prefs）に残る。自分の項目だけは config.json の "custom" に書く
+local PREF_KEY = "aiusage.prefs"
+local CONFIG_PATH = BASE .. "/config.json"
+local function blankPrefs() return { hidden = {}, shown = {}, hiddenViews = {}, order = {} } end
+local prefs = hs.settings.get(PREF_KEY)
+if type(prefs) ~= "table" then prefs = blankPrefs() end
+for k, v in pairs(blankPrefs()) do if type(prefs[k]) ~= "table" then prefs[k] = v end end
+local function savePrefs() hs.settings.set(PREF_KEY, prefs) end
+
+local function orderIndex(id)
+  for i, v in ipairs(prefs.order) do if v == id then return i end end
+  return nil
+end
+local function isVisible(it)
+  return (it.present ~= false or prefs.shown[it.id] == true) and prefs.hidden[it.id] ~= true
+end
+local function sortedAll()
+  local all = {}
+  for i, it in ipairs(rawItems or {}) do all[#all + 1] = { it = it, pos = i } end
+  table.sort(all, function(a, b)
+    return (orderIndex(a.it.id) or (1000 + a.pos)) < (orderIndex(b.it.id) or (1000 + b.pos))
+  end)
+  return all
+end
+
+applyPrefs = function()
+  if not rawItems then return end
+  local list = {}
+  for _, e in ipairs(sortedAll()) do
+    local it = e.it
+    if isVisible(it) then
+      local hv = prefs.hiddenViews[it.id] or {}
+      local vs = {}
+      for _, v in ipairs(it.views or {}) do
+        if hv[v.key] ~= true then table.insert(vs, v) end
+      end
+      if #vs == 0 and it.views and it.views[1] then vs = { it.views[1] } end
+      local copy = {}
+      for k, v in pairs(it) do copy[k] = v end
+      copy.views = vs
+      table.insert(list, copy)
+    end
+  end
+  if #list == 0 then
+    list = { { id = "none", label = L("なし", "None"), views = { { key = "none", sub = "", mode = "percent", center = "--",
+      status = "none", tip1 = L("表示するものがありません", "Nothing to show"), tip2 = L("下の ••• から選んでください", "Pick items from ••• below") } } } }
+  end
+  items = list
+  COUNT = #items
+  H = calcH(COUNT)
+end
+
+local function readConfigFile()
+  local f = io.open(CONFIG_PATH, "r") or io.open(BASE .. "/config.example.json", "r")
+  if not f then return {} end
+  local body = f:read("*a"); f:close()
+  local ok, c = pcall(hs.json.decode, body)
+  return (ok and type(c) == "table") and c or {}
+end
+local function writeConfigFile(c)
+  if type(c.hide) == "table" and next(c.hide) == nil then c.hide = nil end
+  hs.json.write(c, CONFIG_PATH, true, true)
+end
+
+local function addCustom()
+  hs.focus()
+  local next1 = L("次へ", "Next")
+  local b1, name = hs.dialog.textPrompt(L("自分の項目を足す（1/2）", "Add your own item (1/2)"),
+    L("丸の下に出す名前（短く。例: Cursor）", "Name shown under the ring (short, e.g. Cursor)"), "", next1, L("やめる", "Cancel"))
+  if b1 ~= next1 or not name or name == "" then return end
+  local add = L("足す", "Add")
+  local b2, cmd = hs.dialog.textPrompt(L("自分の項目を足す（2/2）", "Add your own item (2/2)"),
+    L("数字を出すコマンド。残り%の数字か、JSON を出してください（くわしくは説明書）。例: echo 42",
+      "A shell command that prints the remaining % as a number, or JSON (see README). Example: echo 42"),
+    "echo 42", add, L("やめる", "Cancel"))
+  if b2 ~= add or not cmd or cmd == "" then return end
+  local c = readConfigFile()
+  if type(c.custom) ~= "table" then c.custom = {} end
+  table.insert(c.custom, { label = name, command = cmd })
+  writeConfigFile(c)
+  refresh(true)
+end
+
+local function removeCustom(it)
+  local c = readConfigFile()
+  local keep = {}
+  for _, x in ipairs(type(c.custom) == "table" and c.custom or {}) do
+    if x.label ~= it.label then table.insert(keep, x) end
+  end
+  c.custom = keep
+  writeConfigFile(c)
+  prefs.hidden[it.id] = nil; prefs.hiddenViews[it.id] = nil
+  savePrefs()
+  refresh(true)
+end
+
+local menuBar = nil
+local function openMenu()
+  if not rawItems then refresh(true); return end
+  local all = sortedAll()
+  local ids = {}
+  for _, e in ipairs(all) do ids[#ids + 1] = e.it.id end
+  local function changed() savePrefs(); applyPrefs(); draw() end
+  local function move(id, d)
+    local i = nil
+    for k, v in ipairs(ids) do if v == id then i = k end end
+    if not i or not ids[i + d] then return end
+    ids[i], ids[i + d] = ids[i + d], ids[i]
+    prefs.order = ids
+    changed()
+  end
+  local m = { { title = L("表示するもの", "Show"), disabled = true } }
+  for idx, e in ipairs(all) do
+    local it = e.it
+    local visible = isVisible(it)
+    local sub = {
+      { title = L("表示する", "Show"), checked = visible, fn = function()
+        if visible then
+          prefs.hidden[it.id] = true; prefs.shown[it.id] = nil
+        else
+          prefs.hidden[it.id] = nil
+          if it.present == false then prefs.shown[it.id] = true end
+        end
+        changed()
+      end },
+    }
+    if type(it.views) == "table" and #it.views > 1 then
+      table.insert(sub, { title = "-" })
+      table.insert(sub, { title = L("出す時間の幅（押すと切り替わる順）", "Views (cycled by clicking)"), disabled = true })
+      local hv = prefs.hiddenViews[it.id] or {}
+      for _, v in ipairs(it.views) do
+        local on = hv[v.key] ~= true
+        table.insert(sub, { title = "   " .. ((v.sub and v.sub ~= "") and v.sub or v.key), checked = on, fn = function()
+          prefs.hiddenViews[it.id] = prefs.hiddenViews[it.id] or {}
+          prefs.hiddenViews[it.id][v.key] = on and true or nil
+          viewIdx[it.id] = 1
+          changed()
+        end })
+      end
+    end
+    table.insert(sub, { title = "-" })
+    table.insert(sub, { title = L("上へ", "Move up"), disabled = idx == 1, fn = function() move(it.id, -1) end })
+    table.insert(sub, { title = L("下へ", "Move down"), disabled = idx == #all, fn = function() move(it.id, 1) end })
+    if it.custom then
+      table.insert(sub, { title = "-" })
+      table.insert(sub, { title = L("この項目を消す", "Remove this item"), fn = function() removeCustom(it) end })
+    end
+    local name = it.label .. ((it.present == false) and L("（この Mac に無い）", " (not found on this Mac)") or "")
+    table.insert(m, { title = name, checked = visible, menu = sub })
+  end
+  table.insert(m, { title = "-" })
+  table.insert(m, { title = L("自分の項目を足す…", "Add your own item…"), fn = function() hs.timer.doAfter(0.1, addCustom) end })
+  table.insert(m, { title = L("設定ファイルを開く", "Open config.json"), fn = function()
+    if not io.open(CONFIG_PATH, "r") then writeConfigFile(readConfigFile()) end
+    hs.task.new("/usr/bin/open", nil, { "-t", CONFIG_PATH }):start()
+  end })
+  table.insert(m, { title = L("表示を最初に戻す", "Reset what is shown"), fn = function()
+    prefs = blankPrefs()
+    for k in pairs(viewIdx) do viewIdx[k] = 1 end
+    changed()
+  end })
+  table.insert(m, { title = L("今すぐ新しくする", "Refresh now"), fn = function() refresh(true) end })
+  menuBar = menuBar or hs.menubar.new(false)
+  menuBar:setMenu(m)
+  local nf = notch:frame()
+  -- 右端なら出っぱりの左に、左端なら右に開く（メニューの幅はおよそ 240 点）
+  local pt = side == "left" and { x = nf.x + nf.w + 6, y = nf.y + 24 } or { x = nf.x - 246, y = nf.y + 24 }
+  tip:hide()
+  menuBar:popupMenu(pt)
+end
+
+-- クリック: そのAIの時間軸を次へ切替。option+クリックで今すぐ最新値に更新。「•••」か ctrl+クリックで表示するものを選ぶ
 local function click(id)
   if not id or id == "body" then return end
+  if id == "gear" or hs.eventtap.checkKeyboardModifiers().ctrl then
+    hs.timer.doAfter(0, openMenu)
+    return
+  end
   if hs.eventtap.checkKeyboardModifiers().alt then
     refresh(true)
     return
@@ -578,6 +761,16 @@ local function peek(sec)
 end
 
 hs.hotkey.bind({ "ctrl", "alt", "cmd" }, "U", function() peek(5) end)
+local rightTap = hs.eventtap.new({ hs.eventtap.event.types.rightMouseDown }, function(e)
+  if mode ~= "docked" or width < OPEN_W * 0.8 then return false end
+  local p = e:location()
+  local nf = notch:frame()
+  if p.x >= nf.x and p.x <= nf.x + nf.w and p.y >= nf.y and p.y <= nf.y + nf.h then
+    hs.timer.doAfter(0, openMenu)
+    return true
+  end
+  return false
+end):start()
 hs.urlevent.bind("ai-usage-refresh", function() refresh(true) end)
 hs.urlevent.bind("ai-usage-peek", function(_, params) peek(tonumber(params and params.sec) or 5) end)
 
@@ -591,5 +784,6 @@ M.cycle = click
 M.items = function() return items end
 M.frame = function() return notch:frame() end
 M.debugShowTip = showTipForId
-M._keep = { notch, tip, motion, edgeWatch, screenWatch, autoRefresh }
+M.openMenu = openMenu
+M._keep = { notch, tip, motion, edgeWatch, screenWatch, autoRefresh, rightTap }
 return M

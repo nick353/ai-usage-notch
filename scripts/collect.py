@@ -920,6 +920,70 @@ def collect_opencode(now, aos, cfg):
     return {"id": "opencode", "label": "OpenCode", "views": views}
 
 
+def collect_custom(cfg):
+    """config.json の "custom" に足した自分の項目。コマンドが出す数字（残り%）か JSON を丸にする。
+    JSON の形: {"percent": 42, "center": "42%", "sub": "週", "tip1": "...", "tip2": "..."} か、その一覧（押すと切り替わる）。"""
+    out = []
+    seen = set()
+    for i, c in enumerate(cfg.get("custom") or []):
+        if not isinstance(c, dict):
+            continue
+        label = str(c.get("label") or f"Custom {i + 1}")[:14]
+        cid = "custom:" + label
+        if cid in seen:
+            cid = f"{cid}:{i}"
+        seen.add(cid)
+        cmd = c.get("command")
+        views = []
+        if isinstance(cmd, str) and cmd.strip():
+            try:
+                r = subprocess.run(["/bin/bash", "-lc", cmd], capture_output=True, text=True,
+                                   timeout=float(c.get("timeout") or 8))
+                txt = (r.stdout or "").strip()
+                raw = None
+                try:
+                    raw = json.loads(txt)
+                except Exception:
+                    raw = None
+                if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                    raw = {"percent": raw}
+                elif raw is None and txt:
+                    try:
+                        raw = {"percent": float(txt.split()[0].rstrip("%"))}
+                    except Exception:
+                        raw = {"center": txt[:5], "tip2": txt[:120]}
+                for j, v in enumerate(raw if isinstance(raw, list) else [raw] if isinstance(raw, dict) else []):
+                    if not isinstance(v, dict):
+                        continue
+                    pct = v.get("percent")
+                    pct = max(0, min(100, round(float(pct)))) if isinstance(pct, (int, float)) and not isinstance(pct, bool) else None
+                    views.append({
+                        "key": str(v.get("key") or f"v{j}"),
+                        "sub": str(v.get("sub") or "")[:8],
+                        "mode": "percent" if pct is not None else "tokens",
+                        "percent": pct,
+                        "center": str(v.get("center") or (f"{pct}%" if pct is not None else "--"))[:5],
+                        "status": v.get("status") or (rem_status(pct) if pct is not None else "info"),
+                        "tip1": str(v.get("tip1") or (f"{label}  " + (T(f"残り {pct}%", f"{pct}% left") if pct is not None else ""))),
+                        "tip2": str(v.get("tip2") or T("自分で足した項目", "Your own item")) + (CLICK if isinstance(raw, list) and len(raw) > 1 else ""),
+                    })
+                if r.returncode != 0 and not views:
+                    views.append({"key": "err", "sub": "", "mode": "percent", "percent": None, "center": "!",
+                                  "status": "danger", "tip1": f"{label}  " + T("コマンドが失敗しました", "Command failed"),
+                                  "tip2": (r.stderr or "").strip()[:120]})
+            except subprocess.TimeoutExpired:
+                views.append({"key": "err", "sub": "", "mode": "percent", "percent": None, "center": "…",
+                              "status": "warn", "tip1": f"{label}  " + T("時間切れ", "Timed out"), "tip2": cmd[:120]})
+            except Exception as e:
+                views.append({"key": "err", "sub": "", "mode": "percent", "percent": None, "center": "!",
+                              "status": "danger", "tip1": f"{label}  " + T("エラー", "Error"), "tip2": str(e)[:120]})
+        if not views:
+            views.append({"key": "none", "sub": "", "mode": "percent", "percent": None, "center": "--", "status": "none",
+                          "tip1": label, "tip2": T("コマンドが何も出しませんでした", "The command printed nothing")})
+        out.append({"id": cid, "label": label, "views": views, "custom": True})
+    return out
+
+
 def main():
     now = time.time()
     cfg = load_config()
@@ -930,7 +994,7 @@ def main():
         collect_codex(now, cache),
         collect_gemini(now, cfg),
         collect_opencode(now, aos, cfg),
-    ]
+    ] + collect_custom(cfg)
     save_cache(cache)
     present = {
         "claude": os.path.isdir(os.path.join(HOME, ".claude")),
@@ -942,7 +1006,7 @@ def main():
     }
     hide = set(cfg.get("hide") or [])
     for it in items:
-        it["present"] = bool(present.get(it["id"], True)) and it["id"] not in hide
+        it["present"] = bool(present.get(it["id"], True)) and it["id"] not in hide and it.get("label") not in hide
     out = {
         "updated_at": int(now),
         "updated_str": fmt_jst(now),

@@ -35,6 +35,35 @@ The first time Claude limits are read, macOS may ask whether `security` can read
 | `option` + click | Refresh now |
 | Long-press or drag | Move the notch anywhere; it snaps to the nearest edge and remembers the spot |
 | `ctrl` + `option` + `cmd` + `U` | Peek for 5 seconds |
+| Click **•••** at the bottom, or right-click | Choose what to show: turn AIs and time windows on/off, reorder, add your own items |
+
+## Make it yours
+
+Click **•••** at the bottom of the notch (or right-click it):
+
+- **Show / hide** each AI. AIs not found on your Mac are listed too, so you can turn them on anyway.
+- **Pick the time windows** each ring cycles through (for example, only "Week" for Claude).
+- **Move up / down** to change the order.
+- **Add your own item…** — show any number you like as a ring. Give it a name and a shell command.
+
+The command can print:
+
+| Prints | Shows |
+|---|---|
+| `42` | A ring with 42% left |
+| `{"percent": 15, "sub": "day", "tip2": "anything"}` | A ring with your own label and tooltip |
+| `[{"percent": 80, "sub": "month"}, {"center": "3", "sub": "todo"}]` | Several views; click the ring to cycle |
+
+Your items are saved in `config.json` under `"custom"`, so you can also edit them there:
+
+```json
+"custom": [
+  {"label": "Demo", "command": "echo 42"},
+  {"label": "OpenRouter", "command": "curl -s https://openrouter.ai/api/v1/credits -H \"Authorization: Bearer $OPENROUTER_API_KEY\" | python3 -c 'import json,sys; d=json.load(sys.stdin)[\"data\"]; print(round(100*(1-d[\"total_usage\"]/d[\"total_credits\"])))'", "timeout": 10}
+]
+```
+
+Commands run with your login shell (`bash -l`), so your `PATH` and environment variables work. Remove an item from its submenu (**Remove this item**). **Reset what is shown** brings back the default view.
 
 ## Where the numbers come from
 
