@@ -1,9 +1,12 @@
 {
+  "refresh_sec": 120,
+  "claude_oauth": true,
+  "claude_oauth_interval_sec": 300,
+  "hide": [],
   "opencode_5h_usd": 7.0,
   "opencode_week_usd": 17.5,
   "opencode_month_usd": 35.0,
   "gemini_5h_usd": 20.0,
   "gemini_week_usd": 65.0,
-  "gemini_month_usd": 200.0,
-  "refresh_sec": 120
+  "gemini_month_usd": 200.0
 }

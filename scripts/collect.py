@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """各AIサブスク（Claude / Codex / Gemini / OpenCode）の残り%と消費量を時間軸ごとに高速集計して JSON で返す。
-ネットワーク通信や秘密ファイル（鍵・トークン）の読み取りは一切行わない。"""
+ふだんはこの Mac の中の記録だけを読む。Claude の週・5時間の枠だけは、ほかに記録が無いとき、
+Claude Code のログイン情報で Anthropic の使用量の窓口に聞く（config.json の claude_oauth: false で止められる）。
+ログイン情報は Anthropic にだけ渡し、保存も表示もしない。"""
 
 import glob
 import json
 import os
 import sqlite3
+import subprocess
+import urllib.request
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -14,7 +18,40 @@ from datetime import datetime, timedelta, timezone
 HOME = os.path.expanduser("~")
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_PATH = os.path.join(HOME, ".cache", "ai-usage-notch", "file-cache.json")
-JST = timezone(timedelta(hours=9))
+JST = None  # 時刻はこの Mac の地域の時刻で出す
+
+
+def _detect_lang():
+    if "--lang" in sys.argv:
+        i = sys.argv.index("--lang")
+        if i + 1 < len(sys.argv):
+            return "ja" if sys.argv[i + 1].startswith("ja") else "en"
+    v = os.environ.get("AIUSAGE_LANG")
+    if v:
+        return "ja" if v.startswith("ja") else "en"
+    try:
+        out = subprocess.run(["/usr/bin/defaults", "read", "-g", "AppleLanguages"],
+                             capture_output=True, text=True, timeout=3).stdout
+        langs = [x.strip(' ",()') for x in out.splitlines()]
+        langs = [x for x in langs if x]
+        return "ja" if langs and langs[0].startswith("ja") else "en"
+    except Exception:
+        return "en"
+
+
+LANG = _detect_lang()
+
+
+def T(ja, en):
+    return ja if LANG == "ja" else en
+
+
+CLICK = T("｜押すと切替", " | click to switch")
+SEP = T("・", " · ")
+
+
+def usd_note(v):
+    return T(f"・目安 ${v:.1f}", f" · ~${v:.1f}") if v and v > 0 else ""
 
 
 def load_config():
@@ -77,7 +114,7 @@ def fmt_jst(ts):
     if not ts:
         return ""
     try:
-        dt = datetime.fromtimestamp(ts, tz=JST)
+        dt = datetime.fromtimestamp(ts)
         return dt.strftime("%-m/%-d %H:%M")
     except Exception:
         return ""
@@ -298,7 +335,81 @@ def collect_claude_projects(now, cache):
     return tot_5h, tot_24h
 
 
-def collect_claude(now, aos, cache):
+def _claude_token(now):
+    """Claude Code のログイン情報から使える鍵を1つ返す（無い・期限切れなら None）。保存も表示もしない。"""
+    tok = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if tok:
+        return tok.strip()
+    raw = ""
+    fp = os.path.join(HOME, ".claude", ".credentials.json")
+    if os.path.isfile(fp):
+        try:
+            with open(fp, encoding="utf-8") as f:
+                raw = f.read()
+        except Exception:
+            raw = ""
+    if not raw and sys.platform == "darwin":
+        try:
+            # 初回だけ macOS が「キーチェーンへのアクセスを許可しますか？」と聞く（「常に許可」で次から出ない）
+            raw = subprocess.run(
+                ["/usr/bin/security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=20).stdout.strip()
+        except Exception:
+            raw = ""
+    if not raw:
+        return None
+    try:
+        o = (json.loads(raw) or {}).get("claudeAiOauth") or {}
+        exp = o.get("expiresAt")
+        if isinstance(exp, (int, float)) and exp / 1000.0 < now:
+            return None  # 期限切れ。Claude Code を次に使ったときに自動で新しくなる
+        return o.get("accessToken") or None
+    except Exception:
+        return None
+
+
+def collect_claude_oauth(now, cache, cfg):
+    """Anthropic の使用量の窓口から Claude の5時間・週の枠（使った%）を聞く。5分に1回まで。"""
+    if cfg.get("claude_oauth") is False:
+        return None
+    c = cache.get("claude_oauth") or {}
+    interval = max(120, int(cfg.get("claude_oauth_interval_sec") or 300))
+    if c.get("at") and now - c["at"] < interval:
+        return c.get("data")
+    if c.get("retry_after") and now < c["retry_after"]:
+        return c.get("data")
+    token = _claude_token(now)
+    if not token:
+        cache["claude_oauth"] = {**c, "retry_after": now + 1800}
+        return c.get("data")
+    req = urllib.request.Request(
+        os.environ.get("AIUSAGE_OAUTH_URL") or "https://api.anthropic.com/api/oauth/usage",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Accept": "application/json",
+            "User-Agent": "claude-cli/2.1.0 (external, cli)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            body = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        cache["claude_oauth"] = {**c, "retry_after": now + 600}
+        return c.get("data")
+
+    def win(key):
+        w = body.get(key)
+        if not isinstance(w, dict) or not isinstance(w.get("utilization"), (int, float)):
+            return None
+        return {"used": max(0.0, min(100.0, float(w["utilization"]))), "resets": parse_iso(w.get("resets_at"))}
+
+    data = {"five": win("five_hour"), "week": win("seven_day")}
+    cache["claude_oauth"] = {"at": now, "data": data}
+    return data
+
+
+def collect_claude(now, aos, cache, cfg=None):
     week_path = os.path.join(HOME, ".config", "aos", "claude-week.json")
     limit_path = os.path.join(HOME, ".config", "aos", "claude-limit.json")
     hist_path = os.path.join(HOME, ".config", "aos", "claude-week-history.jsonl")
@@ -321,6 +432,13 @@ def collect_claude(now, aos, cache):
     # 5時間枠の公式記録があれば拾う
     five_used = None
     five_resets = None
+    oauth = None
+    if week_used is None or not updated_at or now - updated_at > 6 * 3600:
+        oauth = collect_claude_oauth(now, cache, cfg or {})
+    if oauth and oauth.get("week"):
+        week_used = round(oauth["week"]["used"])
+        week_resets = oauth["week"]["resets"]
+        updated_at = now
     for hl in reversed(read_tail_lines(hist_path, max_bytes=32_000)):
         if "fiveLast" not in hl:
             continue
@@ -336,6 +454,10 @@ def collect_claude(now, aos, cache):
         except Exception:
             pass
 
+    if oauth and oauth.get("five"):
+        five_used = round(oauth["five"]["used"])
+        five_resets = oauth["five"]["resets"]
+
     limit_active = None
     if os.path.isfile(limit_path):
         try:
@@ -344,90 +466,90 @@ def collect_claude(now, aos, cache):
             until = parse_iso(lim.get("until"))
             at = parse_iso(lim.get("at"))
             if lim.get("kind") == "signed_out":
-                limit_active = "サインアウト中"
+                limit_active = T("サインアウト中", "Signed out")
             elif until and until > now:
-                limit_active = f"上限中（{fmt_jst(until)} まで）"
+                limit_active = T(f"上限中（{fmt_jst(until)} まで）", f"Limit reached (until {fmt_jst(until)})")
             elif at and (now - at) < 6 * 3600 and not until:
-                limit_active = "上限中"
+                limit_active = T("上限中", "Limit reached")
         except Exception:
             pass
 
     chat_5h, chat_24h = collect_claude_projects(now, cache)
     tok_5h = max(aos["claude_5h_tok"], chat_5h)
     tok_24h = max(aos["claude_24h_tok"], chat_24h)
-    rec_str = f"記録 {fmt_jst(updated_at)}" if updated_at else ""
+    rec_str = T(f"記録 {fmt_jst(updated_at)}", f"recorded {fmt_jst(updated_at)}") if updated_at else ""
 
     views = []
 
     # 1) 公式の5時間枠が取れていれば先頭に置く（一番小さい制限時間軸）
     if five_used is not None:
         rem5 = max(0, 100 - five_used)
-        rst5 = f"（{fmt_jst(five_resets)} に戻る）" if five_resets else ""
+        rst5 = T(f"（{fmt_jst(five_resets)} に戻る）", f" (resets {fmt_jst(five_resets)})") if five_resets else ""
         views.append({
             "key": "5h",
-            "sub": "5時間",
+            "sub": T("5時間", "5h"),
             "mode": "percent",
             "percent": rem5,
             "center": f"{rem5}%",
             "status": rem_status(rem5),
-            "tip1": f"Claude  5時間 残り {rem5}%{rst5}",
-            "tip2": f"5時間消費 {fmt_tokens(tok_5h)}・AOS目安 ${aos['claude_5h_usd']:.1f}｜押すと切替",
+            "tip1": T(f"Claude  5時間 残り {rem5}%{rst5}", f"Claude  5h: {rem5}% left{rst5}"),
+            "tip2": T(f"5時間消費 {fmt_tokens(tok_5h)}", f"5h used {fmt_tokens(tok_5h)} tokens") + usd_note(aos['claude_5h_usd']) + CLICK,
         })
 
     # 2) 週間枠（公式）
     if limit_active:
         views.append({
             "key": "week",
-            "sub": "週間",
+            "sub": T("週間", "Week"),
             "mode": "percent",
             "percent": 0,
             "center": "0%",
             "status": "danger",
             "tip1": f"Claude  {limit_active}",
-            "tip2": f"24時間 {fmt_tokens(tok_24h)}・AOS目安 ${aos['claude_24h_usd']:.1f}｜押すと切替",
+            "tip2": T(f"24時間 {fmt_tokens(tok_24h)}", f"24h {fmt_tokens(tok_24h)} tokens") + usd_note(aos['claude_24h_usd']) + CLICK,
         })
     elif week_used is not None:
         rem_w = max(0, 100 - week_used)
-        rst_w = f"（{fmt_jst(week_resets)} に戻る）" if week_resets else ""
-        parts = [f"24時間 {fmt_tokens(tok_24h)}"]
+        rst_w = T(f"（{fmt_jst(week_resets)} に戻る）", f" (resets {fmt_jst(week_resets)})") if week_resets else ""
+        parts = [T(f"24時間 {fmt_tokens(tok_24h)}", f"24h {fmt_tokens(tok_24h)} tokens")]
         if aos["claude_24h_usd"] > 0:
-            parts.append(f"AOS目安 ${aos['claude_24h_usd']:.1f}")
+            parts.append(T(f"目安 ${aos['claude_24h_usd']:.1f}", f"~${aos['claude_24h_usd']:.1f}"))
         if rec_str:
             parts.append(rec_str)
         views.append({
             "key": "week",
-            "sub": "週間",
+            "sub": T("週間", "Week"),
             "mode": "percent",
             "percent": rem_w,
             "center": f"{rem_w}%",
             "status": rem_status(rem_w),
-            "tip1": f"Claude  週間 残り {rem_w}%{rst_w}",
-            "tip2": "・".join(parts) + "｜押すと切替",
+            "tip1": T(f"Claude  週間 残り {rem_w}%{rst_w}", f"Claude  Week: {rem_w}% left{rst_w}"),
+            "tip2": SEP.join(parts) + CLICK,
         })
 
     # 3) 公式5時間%が無い場合は、5時間消費量を切替ビューに置く
     if five_used is None:
         views.append({
             "key": "5h_tok",
-            "sub": "5h消費",
+            "sub": T("5h消費", "5h used"),
             "mode": "tokens",
             "percent": None,
             "center": fmt_tokens(tok_5h),
             "status": "info" if tok_5h > 0 else "none",
-            "tip1": f"Claude  直近5時間の消費 {fmt_tokens(tok_5h)} トークン",
-            "tip2": f"AOS目安 ${aos['claude_5h_usd']:.1f}（公式の5時間%は未記録）｜押すと切替",
+            "tip1": T(f"Claude  直近5時間の消費 {fmt_tokens(tok_5h)} トークン", f"Claude  last 5h: {fmt_tokens(tok_5h)} tokens"),
+            "tip2": T("公式の5時間%は未取得", "official 5h % not available") + usd_note(aos['claude_5h_usd']) + CLICK,
         })
 
     # 4) 24時間消費量
     views.append({
         "key": "24h_tok",
-        "sub": "24h消費",
+        "sub": T("24h消費", "24h used"),
         "mode": "tokens",
         "percent": None,
         "center": fmt_tokens(tok_24h),
         "status": "info" if tok_24h > 0 else "none",
-        "tip1": f"Claude  24時間の消費 {fmt_tokens(tok_24h)} トークン",
-        "tip2": f"AOS目安 ${aos['claude_24h_usd']:.1f}｜押すと切替",
+        "tip1": T(f"Claude  24時間の消費 {fmt_tokens(tok_24h)} トークン", f"Claude  last 24h: {fmt_tokens(tok_24h)} tokens"),
+        "tip2": T("24時間の消費量", "24h usage") + usd_note(aos['claude_24h_usd']) + CLICK,
     })
 
     return {"id": "claude", "label": "Claude", "views": views}
@@ -535,21 +657,21 @@ def collect_codex(now, cache):
                 windows.append((wmin, wobj))
         windows.sort(key=lambda x: x[0])
 
-        bal_note = f"残クレジット {credits_bal:,.0f}" if has_balance else ""
-        rec_note = f"記録 {fmt_jst(latest_ts)}" if latest_ts else ""
+        bal_note = T(f"残クレジット {credits_bal:,.0f}", f"credits left {credits_bal:,.0f}") if has_balance else ""
+        rec_note = T(f"記録 {fmt_jst(latest_ts)}", f"recorded {fmt_jst(latest_ts)}") if latest_ts else ""
 
         for wmin, wobj in windows:
             used_pct = round(max(0.0, min(100.0, float(wobj["used_percent"]))))
             rem_pct = max(0, 100 - used_pct)
             rst = wobj.get("resets_at")
-            rst_str = f"（{fmt_jst(rst)} に戻る）" if rst else ""
+            rst_str = T(f"（{fmt_jst(rst)} に戻る）", f" (resets {fmt_jst(rst)})") if rst else ""
             if wmin >= 1440:
-                sub, title = "週間", "週間"
+                sub, title = T("週間", "Week"), T("週間", "Week")
             elif wmin >= 60:
                 h = int(wmin // 60)
-                sub, title = f"{h}時間", f"{h}時間"
+                sub, title = T(f"{h}時間", f"{h}h"), T(f"{h}時間", f"{h}h")
             else:
-                sub, title = "枠", "枠"
+                sub, title = T("枠", "Limit"), T("枠", "Limit")
 
             st = rem_status(rem_pct)
             if rem_pct == 0 and has_balance:
@@ -557,7 +679,7 @@ def collect_codex(now, cache):
             parts = []
             if bal_note:
                 parts.append(bal_note)
-            parts.append(f"24時間 {fmt_tokens(tok_24h)}")
+            parts.append(T(f"24時間 {fmt_tokens(tok_24h)}", f"24h {fmt_tokens(tok_24h)} tokens"))
             if rec_note:
                 parts.append(rec_note)
             views.append({
@@ -567,33 +689,33 @@ def collect_codex(now, cache):
                 "percent": rem_pct,
                 "center": f"{rem_pct}%",
                 "status": st,
-                "tip1": f"Codex  {title} 残り {rem_pct}%{rst_str}",
-                "tip2": "・".join(parts) + "｜押すと切替",
+                "tip1": T(f"Codex  {title} 残り {rem_pct}%{rst_str}", f"Codex  {title}: {rem_pct}% left{rst_str}"),
+                "tip2": SEP.join(parts) + CLICK,
             })
 
     # 直近5時間の消費トークン
     views.append({
         "key": "5h_tok",
-        "sub": "5h消費",
+        "sub": T("5h消費", "5h used"),
         "mode": "tokens",
         "percent": None,
         "center": fmt_tokens(tok_5h),
         "status": "info" if tok_5h > 0 else "none",
-        "tip1": f"Codex  直近5時間の消費 {fmt_tokens(tok_5h)} トークン",
-        "tip2": f"24時間 {fmt_tokens(tok_24h)}（このプランは週間枠のみ）｜押すと切替",
+        "tip1": T(f"Codex  直近5時間の消費 {fmt_tokens(tok_5h)} トークン", f"Codex  last 5h: {fmt_tokens(tok_5h)} tokens"),
+        "tip2": T(f"24時間 {fmt_tokens(tok_24h)}（このプランは週間枠のみ）", f"24h {fmt_tokens(tok_24h)} tokens (weekly limit only on this plan)") + CLICK,
     })
 
     # 追加クレジット残高があるときは切替ビューに足す
     if has_balance and credits_bal is not None:
         views.append({
             "key": "credits",
-            "sub": "残クレ",
+            "sub": T("残クレ", "Credits"),
             "mode": "tokens",
             "percent": None,
             "center": fmt_short_num(credits_bal),
             "status": "ok",
-            "tip1": f"Codex  追加クレジット 残り {credits_bal:,.0f}",
-            "tip2": f"週間枠を使い切ってもこの残高から稼働｜押すと切替",
+            "tip1": T(f"Codex  追加クレジット 残り {credits_bal:,.0f}", f"Codex  extra credits left {credits_bal:,.0f}"),
+            "tip2": T("週間枠を使い切ってもこの残高から稼働", "used after the weekly limit runs out") + CLICK,
         })
 
     return {"id": "codex", "label": "Codex", "views": views}
@@ -695,15 +817,15 @@ def collect_gemini(now, cfg):
             "percent": rem,
             "center": f"{rem}%",
             "status": rem_status(rem),
-            "tip1": f"Gemini  {title} 残り 約{rem}%（目安 ${usd:.2f} / ${cap:.0f}）",
-            "tip2": f"消費 {fmt_tokens(tok)} トークン（/usage の実測で補正可）｜押すと切替",
+            "tip1": T(f"Gemini  {title} 残り 約{rem}%（目安 ${usd:.2f} / ${cap:.0f}）", f"Gemini  {title}: ~{rem}% left (est. ${usd:.2f} / ${cap:.0f})"),
+            "tip2": T(f"消費 {fmt_tokens(tok)} トークン（config.json で目安を補正可）", f"{fmt_tokens(tok)} tokens used (tune caps in config.json)") + CLICK,
         }
 
     # 一番小さい時間軸（5時間 → 週間 → 月間）の順に並べる
     views = [
-        make_view("5h", "5時間", "5時間", u5, cap_5h, t5),
-        make_view("week", "週間", "週間", u7, cap_w, t7),
-        make_view("month", "月間", "月間", u30, cap_m, t30),
+        make_view("5h", T("5時間", "5h"), T("5時間", "5h"), u5, cap_5h, t5),
+        make_view("week", T("週間", "Week"), T("週間", "Week"), u7, cap_w, t7),
+        make_view("month", T("月間", "Month"), T("月間", "Month"), u30, cap_m, t30),
     ]
     return {"id": "gemini", "label": "Gemini", "views": views}
 
@@ -772,12 +894,12 @@ def collect_opencode(now, aos, cfg):
         if hit_down and down_until:
             rem = 0
             st = "danger"
-            tip1 = f"OpenCode Go  {title} 残り 0%（{fmt_jst(down_until)} まで停止）"
+            tip1 = T(f"OpenCode Go  {title} 残り 0%（{fmt_jst(down_until)} まで停止）", f"OpenCode Go  {title}: 0% left (paused until {fmt_jst(down_until)})")
         else:
             used_pct = min(100.0, (usd / cap) * 100) if cap > 0 else 0.0
             rem = max(0, round(100.0 - used_pct))
             st = rem_status(rem)
-            tip1 = f"OpenCode Go  {title} 残り {rem}%（消費 ${usd:.2f} / ${cap:.1f}）"
+            tip1 = T(f"OpenCode Go  {title} 残り {rem}%（消費 ${usd:.2f} / ${cap:.1f}）", f"OpenCode Go  {title}: {rem}% left (${usd:.2f} / ${cap:.1f} used)")
         return {
             "key": key,
             "sub": sub,
@@ -786,14 +908,14 @@ def collect_opencode(now, aos, cfg):
             "center": f"{rem}%",
             "status": st,
             "tip1": tip1,
-            "tip2": f"5h ${usd_5h:.2f}・週 ${usd_w:.2f}・月 ${usd_m:.2f}｜押すと切替",
+            "tip2": T(f"5h ${usd_5h:.2f}・週 ${usd_w:.2f}・月 ${usd_m:.2f}", f"5h ${usd_5h:.2f} · week ${usd_w:.2f} · month ${usd_m:.2f}") + CLICK,
         }
 
     # 一番小さい時間軸（5時間 → 週間 → 月間）の順に並べる
     views = [
-        make_view("5h", "5時間", "5時間", usd_5h, cap_5h, down_until is not None),
-        make_view("week", "週間", "週間", usd_w, cap_w, down_until is not None and "week" in (down_limit or "").lower()),
-        make_view("month", "月間", "月間", usd_m, cap_m, down_until is not None and "month" in (down_limit or "").lower()),
+        make_view("5h", T("5時間", "5h"), T("5時間", "5h"), usd_5h, cap_5h, down_until is not None),
+        make_view("week", T("週間", "Week"), T("週間", "Week"), usd_w, cap_w, down_until is not None and "week" in (down_limit or "").lower()),
+        make_view("month", T("月間", "Month"), T("月間", "Month"), usd_m, cap_m, down_until is not None and "month" in (down_limit or "").lower()),
     ]
     return {"id": "opencode", "label": "OpenCode", "views": views}
 
@@ -804,12 +926,23 @@ def main():
     cache = load_cache()
     aos = collect_aos_usage(now)
     items = [
-        collect_claude(now, aos, cache),
+        collect_claude(now, aos, cache, cfg),
         collect_codex(now, cache),
         collect_gemini(now, cfg),
         collect_opencode(now, aos, cfg),
     ]
     save_cache(cache)
+    present = {
+        "claude": os.path.isdir(os.path.join(HOME, ".claude")),
+        "codex": os.path.isdir(os.path.join(HOME, ".codex")),
+        "gemini": bool(glob.glob(os.path.join(HOME, ".gemini", "antigravity-cli", "brain")))
+        or os.path.isfile(os.path.join(HOME, ".config", "aos", "gemini-usage.jsonl")),
+        "opencode": os.path.isfile(os.path.join(HOME, ".local", "share", "opencode", "opencode.db"))
+        or aos.get("go_30d", 0) > 0,
+    }
+    hide = set(cfg.get("hide") or [])
+    for it in items:
+        it["present"] = bool(present.get(it["id"], True)) and it["id"] not in hide
     out = {
         "updated_at": int(now),
         "updated_str": fmt_jst(now),

@@ -1,19 +1,85 @@
-# AI Usage Notch（AI トークン消費サイドノッチ）
+# AI Usage Notch
 
-画面の端の黒いサイドノッチから、契約している AI サブスク（Claude / Codex / Gemini / OpenCode）の枠の消費率やトークン消費量を一瞬で確認できる macOS 用の道具です。
+**See how much of your Claude, Codex, Gemini and OpenCode limits you have left — from a tiny black notch on the edge of your Mac screen.**
 
-- 見た目・操作感（マウスを寄せると出る・長押しでつまんで運べる・近い端へ吸い寄せられる）は `~/Projects/work-recorder` と揃えています。
-- すべてこの Mac 内のログや記録ファイルからローカルで集計するため、追加のパスワード・鍵・外部通信は不要です。
+[日本語](README.ja.md)
 
-## 入れ方・外し方・点検
-- 反映: `./install.sh`
-- 点検: `./doctor.sh`
-- 外す: `./uninstall.sh`（録画ボタンには触りません）
+<p align="center"><img src="docs/demo.gif" width="200" alt="Move the mouse to the screen edge and the notch opens"> &nbsp; <img src="docs/screenshot.png" width="200" alt="Remaining limits for each AI"></p>
 
-## 操作
-- 画面右端の下寄り（録画ボタンの下）の細い黒い線にマウスを寄せる → 4つの輪が出る（数字は「残り%」、最初は一番小さい時間軸）
-- 輪をクリック → 時間軸を切り替え（5時間 → 週間 → 月間 など）
-- `option` を押しながらクリック → 今すぐ最新値に更新
-- 各輪にカーソルを乗せる → 戻る日時・残クレジット・消費量などの詳細が吹き出しで出る
-- 長押し（0.25秒）かドラッグ → 好きな位置・左右の端へ運べる（位置は自動保存）
-- `ctrl + option + cmd + U` → 5秒間パッと開いて確認
+- **Out of the way.** No menu-bar icon, no window. A 6-pixel line sits on the screen edge and opens only when your mouse touches it.
+- **Remaining %, like a battery.** Green = plenty, orange = getting low, red = almost out.
+- **Every AI you pay for, in one place.** Claude (5-hour and weekly limits), Codex (weekly limit and extra credits), Gemini/Antigravity and OpenCode Go.
+- **Only shows what you use.** AIs that are not installed on your Mac are hidden automatically.
+- **Small and readable.** About 1,400 lines of Lua + Python on top of [Hammerspoon](https://www.hammerspoon.org/). No app to trust, no account, no telemetry.
+
+## Install (1 minute)
+
+You need macOS and [Hammerspoon](https://www.hammerspoon.org/) (free).
+
+```bash
+brew install --cask hammerspoon   # skip if you already have it
+git clone https://github.com/nick353/ai-usage-notch.git ~/ai-usage-notch && ~/ai-usage-notch/install.sh
+```
+
+Open Hammerspoon once and allow **Accessibility** when macOS asks. Then move your mouse to the right edge of the screen, slightly below the middle.
+
+The first time Claude limits are read, macOS may ask whether `security` can read the **"Claude Code-credentials"** keychain item. Click **Always Allow** (see [Privacy](#privacy)).
+
+## How to use
+
+| Do this | What happens |
+|---|---|
+| Touch the screen edge | The notch opens |
+| Hover a ring | Details: when the limit resets, tokens used, credits left |
+| Click a ring | Switch the time window (5h → week → month, or limit → tokens) |
+| `option` + click | Refresh now |
+| Long-press or drag | Move the notch anywhere; it snaps to the nearest edge and remembers the spot |
+| `ctrl` + `option` + `cmd` + `U` | Peek for 5 seconds |
+
+## Where the numbers come from
+
+| AI | Source | What you see |
+|---|---|---|
+| Claude | Anthropic's usage endpoint, using your existing Claude Code login (every 5 min at most). Token counts from `~/.claude/projects/` | 5-hour and weekly limit left, tokens in the last 5h / 24h |
+| Codex | The latest `rate_limits` in `~/.codex/sessions/` | Weekly limit left, extra credits, tokens |
+| Gemini | Antigravity transcripts in `~/.gemini/antigravity-cli/` | Estimated % left against the caps in `config.json` |
+| OpenCode Go | `~/.local/share/opencode/opencode.db` | Spend vs. the caps in `config.json` |
+
+Gemini and OpenCode do not publish a remaining-% number, so those are estimates. Adjust the caps in `config.json` to match your plan.
+
+## Settings
+
+Copy `config.example.json` to `config.json` (the installer does this for you) and edit:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `lang` | your macOS language | `"en"` or `"ja"` |
+| `hide` | `[]` | AIs to hide, e.g. `["gemini"]` |
+| `claude_oauth` | `true` | Set `false` to never read the Claude Code login (you will still see token counts) |
+| `claude_oauth_interval_sec` | `300` | How often to ask Anthropic for Claude limits |
+| `refresh_sec` | `120` | How often to refresh everything else |
+| `gemini_*_usd`, `opencode_*_usd` | see file | Caps used for the estimated % |
+
+Run `./doctor.sh` to check your setup.
+
+## Privacy
+
+- Everything except one request runs **locally** and only reads the files listed above.
+- That one request: to show Claude's official 5-hour/weekly limits, the notch reads the token Claude Code already stored in your keychain (or `CLAUDE_CODE_OAUTH_TOKEN`) and sends it **only to `api.anthropic.com`** — the same place Claude Code sends it. The token is never written to disk, logged or shown. Other usage monitors such as [CodexBar](https://github.com/steipete/CodexBar) use the same approach. Turn it off with `"claude_oauth": false`.
+- The endpoint is not officially documented by Anthropic and may change. If it fails, the notch quietly falls back to token counts.
+
+## Uninstall
+
+```bash
+~/ai-usage-notch/uninstall.sh
+```
+
+It removes only its own block from `~/.hammerspoon/init.lua`.
+
+## Related
+
+- [Work Recorder](https://github.com/nick353/work-recorder) — a matching edge notch that records your screen and voice so an AI can learn the task.
+
+## License
+
+MIT

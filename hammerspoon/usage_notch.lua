@@ -22,6 +22,10 @@ local function loadConfig()
 end
 local CONFIG = loadConfig()
 local REFRESH_SEC = tonumber(CONFIG.refresh_sec) or 120
+-- 言語: config.json の "lang"（"ja" / "en"）があればそれ、無ければ Mac の言語（日本語なら日本語、ほかは英語）
+local LANG = CONFIG.lang or (((hs.host.locale.preferredLanguages() or {})[1] or "en"):sub(1, 2) == "ja" and "ja" or "en")
+LANG = tostring(LANG):sub(1, 2) == "ja" and "ja" or "en"
+local function L(ja, en) return LANG == "ja" and ja or en end
 
 local function clamp(v, a, b) return math.max(a, math.min(b, v)) end
 
@@ -59,7 +63,7 @@ local function placeholder(id, label)
   return {
     id = id,
     label = label,
-    views = { { key = "init", sub = "読込中", mode = "percent", percent = nil, center = "--", status = "none", tip1 = label .. "  読み込み中...", tip2 = "しばらくお待ちください" } },
+    views = { { key = "init", sub = L("読込中", "loading"), mode = "percent", percent = nil, center = "--", status = "none", tip1 = label .. L("  読み込み中...", "  loading..."), tip2 = L("しばらくお待ちください", "one moment") } },
   }
 end
 
@@ -330,14 +334,22 @@ local function refresh(force)
     if code == 0 and out and #out > 0 then
       local ok, data = pcall(hs.json.decode, out)
       if ok and type(data) == "table" and type(data.items) == "table" and #data.items > 0 then
-        items = data.items
+        -- 使っていない AI（present = false）の丸は出さない。丸の数に合わせて高さも変える
+        local shown = {}
+        for _, it in ipairs(data.items) do
+          if it.present ~= false then table.insert(shown, it) end
+        end
+        if #shown == 0 then shown = { data.items[1] } end
+        items = shown
+        COUNT = #items
+        H = 28 + STEP * (COUNT - 1) + 42
       end
     end
     draw()
     if activeHoverId and mode == "docked" and width >= OPEN_W * 0.8 then
       showTipForId(activeHoverId)
     end
-  end, { COLLECT })
+  end, { COLLECT, "--lang", LANG })
   if not fetchTask:start() then
     fetchTask = nil
     loading = false
