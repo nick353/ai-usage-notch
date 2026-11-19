@@ -10,7 +10,7 @@
 - **Remaining %, like a battery.** Green = plenty, orange = getting low, red = almost out.
 - **Every AI you pay for, in one place.** Claude (5-hour and weekly limits), Codex (weekly limit and extra credits), Gemini/Antigravity and OpenCode Go.
 - **Only shows what you use.** AIs that are not installed on your Mac are hidden automatically.
-- **Small and readable.** About 1,400 lines of Lua + Python on top of [Hammerspoon](https://www.hammerspoon.org/). No app to trust, no account, no telemetry.
+- **Small and readable.** About 1,800 lines of Lua + Python on top of [Hammerspoon](https://www.hammerspoon.org/). No app to trust, no account, no telemetry.
 
 ## Install (1 minute)
 

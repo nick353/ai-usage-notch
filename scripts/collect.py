@@ -732,8 +732,8 @@ def gemini_model_rates(model):
         return (0.30, 0.03, 2.50)
     if "hydrogen" in m or "argon" in m:
         return (1.25, 0.125, 10.0)
-    # neon / pro 系の既定
-    return (2.0, 0.20, 12.0)
+    # neon / pro 系の既定（Gemini 4 Neon 公式単価: 入力$3・キャッシュ$0.15・出力$15）
+    return (3.0, 0.15, 15.0)
 
 
 def collect_gemini(now, cfg):

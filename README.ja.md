@@ -10,7 +10,7 @@
 - **電池と同じ「残り%」。** 緑はたっぷり、オレンジは少なめ、赤はもうすぐ切れます。
 - **契約している AI をまとめて。** Claude（5時間と週の枠）、Codex（週の枠と追加クレジット）、Gemini（Antigravity）、OpenCode Go。
 - **使っているものだけ出る。** Mac に入っていない AI の丸は自動で隠れます。
-- **小さくて中身が読める。** [Hammerspoon](https://www.hammerspoon.org/) の上で動く、約1,400行の Lua と Python です。アカウントも、利用状況の送信もありません。
+- **小さくて中身が読める。** [Hammerspoon](https://www.hammerspoon.org/) の上で動く、約1,800行の Lua と Python です。アカウントも、利用状況の送信もありません。
 
 ## 入れ方（1分）
 
