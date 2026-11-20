@@ -87,7 +87,8 @@ Copy `config.example.json` to `config.json` (the installer does this for you) an
 | `claude_oauth` | `true` | Set `false` to never read the Claude Code login (you will still see token counts) |
 | `claude_oauth_interval_sec` | `300` | How often to ask Anthropic for Claude limits |
 | `refresh_sec` | `120` | How often to refresh everything else |
-| `gemini_*_usd`, `opencode_*_usd` | see file | Caps used for the estimated % |
+| `gemini_plan` | `"auto"` | Gemini plan baseline (`"auto"`, `"free"`, `"plus"`, `"pro"`, `"ultra_5x"`, `"ultra_20x"`). `auto` detects your tier from `agy models` and usage; also switchable from the **•••** menu |
+| `gemini_*_usd`, `opencode_*_usd` | optional | Manual overrides for the estimated % caps |
 
 Run `./doctor.sh` to check your setup.
 

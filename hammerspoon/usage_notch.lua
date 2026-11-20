@@ -334,12 +334,14 @@ end
 
 ---------------------------------------------------------------- 非同期データ更新
 local fetchTask = nil
-local function refresh(force)
+local function refresh(force, refreshPlan)
   if fetchTask then return end
   local now = hs.timer.secondsSinceEpoch()
   if not force and (now - lastFetch) < 15 then return end
   loading = true
   if mode == "docked" and width > REST_W + 1 then draw() end
+  local args = { COLLECT, "--lang", LANG }
+  if refreshPlan then table.insert(args, "--refresh-plan") end
   fetchTask = hs.task.new("/usr/bin/python3", function(code, out)
     fetchTask = nil
     loading = false
@@ -355,7 +357,7 @@ local function refresh(force)
     if activeHoverId and mode == "docked" and width >= OPEN_W * 0.8 then
       showTipForId(activeHoverId)
     end
-  end, { COLLECT, "--lang", LANG })
+  end, args)
   if not fetchTask:start() then
     fetchTask = nil
     loading = false
@@ -571,6 +573,37 @@ local function openMenu()
         end })
       end
     end
+    if it.id == "gemini" then
+      local curCfg = readConfigFile()
+      local curPlan = tostring(curCfg.gemini_plan or "auto"):lower()
+      local detectedLabel = tostring(it.plan_label or "Pro")
+      local function setPlan(val)
+        local c = readConfigFile()
+        c.gemini_plan = val
+        c.gemini_5h_usd = nil
+        c.gemini_week_usd = nil
+        c.gemini_month_usd = nil
+        writeConfigFile(c)
+        refresh(true, true)
+      end
+      table.insert(sub, { title = "-" })
+      table.insert(sub, { title = L("プラン（目安の基準）", "Plan (cap baseline)"), disabled = true })
+      local planOpts = {
+        { key = "auto",      title = L("   自動判定（いま: " .. detectedLabel .. "）", "   Auto (now: " .. detectedLabel .. ")") },
+        { key = "free",      title = "   Free" },
+        { key = "plus",      title = "   Plus ($5)" },
+        { key = "pro",       title = "   Pro ($20)" },
+        { key = "ultra_5x",  title = "   Ultra 5x ($100)" },
+        { key = "ultra_20x", title = "   Ultra 20x ($200)" },
+      }
+      for _, opt in ipairs(planOpts) do
+        table.insert(sub, {
+          title = opt.title,
+          checked = (curPlan == opt.key) or (opt.key == "auto" and curPlan == ""),
+          fn = function() setPlan(opt.key) end,
+        })
+      end
+    end
     table.insert(sub, { title = "-" })
     table.insert(sub, { title = L("上へ", "Move up"), disabled = idx == 1, fn = function() move(it.id, -1) end })
     table.insert(sub, { title = L("下へ", "Move down"), disabled = idx == #all, fn = function() move(it.id, 1) end })
@@ -592,7 +625,7 @@ local function openMenu()
     for k in pairs(viewIdx) do viewIdx[k] = 1 end
     changed()
   end })
-  table.insert(m, { title = L("今すぐ新しくする", "Refresh now"), fn = function() refresh(true) end })
+  table.insert(m, { title = L("今すぐ新しくする", "Refresh now"), fn = function() refresh(true, true) end })
   menuBar = menuBar or hs.menubar.new(false)
   menuBar:setMenu(m)
   local nf = notch:frame()
@@ -610,7 +643,7 @@ local function click(id)
     return
   end
   if hs.eventtap.checkKeyboardModifiers().alt then
-    refresh(true)
+    refresh(true, true)
     return
   end
   local _, it = itemCy(id)

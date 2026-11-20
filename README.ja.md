@@ -87,7 +87,8 @@ Gemini と OpenCode は「残り%」を公開していないので、推定で�
 | `claude_oauth` | `true` | `false` にすると Claude Code のログインを読まない（使った量だけ出る） |
 | `claude_oauth_interval_sec` | `300` | Claude の枠を聞く間隔（秒） |
 | `refresh_sec` | `120` | ほかの数字を新しくする間隔（秒） |
-| `gemini_*_usd`・`opencode_*_usd` | ファイルを参照 | 推定の残り%に使う目安 |
+| `gemini_plan` | `"auto"` | Gemini のプラン基準（`"auto"`・`"free"`・`"plus"`・`"pro"`・`"ultra_5x"`・`"ultra_20x"`）。`auto` は使えるモデルと消費実測から自動判定。**•••** メニューからも切替可能 |
+| `gemini_*_usd`・`opencode_*_usd` | 任意 | 推定の残り%に使う目安を手動で上書きしたい場合のみ |
 
 `./doctor.sh` で設定を点検できます。
 

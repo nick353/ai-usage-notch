@@ -9,6 +9,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import urllib.request
@@ -895,12 +896,116 @@ def _compute_gemini_5h_window(events, now, known_resets):
     return {"active": True, "win_start": win_start, "win_end": win_end, "usd": u5, "tok": t5}
 
 
-def collect_gemini(now, cfg, cache=None):
+# Gemini / Google AI プラン別の目安上限（USD 換算。Pro は実測の429到達額 $24.6 基準、Ultra は公式倍率 5x / 20x）
+GEMINI_PLAN_ORDER = ("free", "plus", "pro", "ultra_5x", "ultra_20x")
+GEMINI_PLANS = {
+    "free":      {"label": "Free",      "5h": 6.0,   "week": 15.0,   "month": 50.0},
+    "plus":      {"label": "Plus",      "5h": 12.0,  "week": 32.0,   "month": 100.0},
+    "pro":       {"label": "Pro",       "5h": 25.0,  "week": 65.0,   "month": 200.0},
+    "ultra_5x":  {"label": "Ultra 5x",  "5h": 125.0, "week": 325.0,  "month": 1000.0},
+    "ultra_20x": {"label": "Ultra 20x", "5h": 500.0, "week": 1300.0, "month": 4000.0},
+}
+GEMINI_PLAN_ALIASES = {
+    "free": "free",
+    "plus": "plus",
+    "pro": "pro",
+    "20": "pro",
+    "ultra": "ultra_5x",
+    "ultra5": "ultra_5x",
+    "ultra5x": "ultra_5x",
+    "ultra_5x": "ultra_5x",
+    "5x": "ultra_5x",
+    "100": "ultra_5x",
+    "ultra20": "ultra_20x",
+    "ultra20x": "ultra_20x",
+    "ultra_20x": "ultra_20x",
+    "20x": "ultra_20x",
+    "200": "ultra_20x",
+}
+
+
+def _find_agy_bin():
+    for cand in (
+        os.environ.get("AOS_AGY_BIN"),
+        os.path.join(HOME, ".local", "bin", "agy"),
+        shutil.which("agy"),
+    ):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _probe_gemini_plan(now, cache, force=False):
+    """公式 CLI の `agy models` から現在の Google AI プランを推定する（30分キャッシュ）。"""
+    c = cache.get("gemini_plan_probe_v1") or {}
+    if not force and c.get("plan") in GEMINI_PLANS:
+        ttl = 300 if c.get("fallback") else 1800
+        if c.get("at") and (now - float(c["at"])) < ttl:
+            return c["plan"]
+
+    agy = _find_agy_bin()
+    if not agy:
+        plan = c.get("plan") if c.get("plan") in GEMINI_PLANS else "pro"
+        cache["gemini_plan_probe_v1"] = {"at": now, "plan": plan, "fallback": True}
+        return plan
+
+    try:
+        r = subprocess.run([agy, "models"], capture_output=True, text=True, timeout=12)
+        txt = ((r.stdout or "") + "\n" + (r.stderr or "")).lower()
+        detected = None
+        if r.returncode == 0 and txt.strip():
+            if "gemini-4-carbon" in txt or "g1-ultra" in txt or "orchestrator-ultra" in txt:
+                detected = "ultra_5x"
+            elif "gemini-4-neon" in txt or "g1-pro" in txt:
+                detected = "pro"
+            elif "gemini-4-hydrogen" in txt:
+                detected = "plus"
+            elif "gemini-" in txt:
+                detected = "free"
+        if detected:
+            cache["gemini_plan_probe_v1"] = {"at": now, "plan": detected, "fallback": False}
+            return detected
+    except Exception:
+        pass
+
+    plan = c.get("plan") if c.get("plan") in GEMINI_PLANS else "pro"
+    cache["gemini_plan_probe_v1"] = {"at": now, "plan": plan, "fallback": True}
+    return plan
+
+
+def _resolve_gemini_plan(now, cfg, cache, u5, active_reset, force_plan=False):
+    raw = str(cfg.get("gemini_plan") or "auto").strip().lower().replace("-", "_").replace(" ", "_")
+    alias = GEMINI_PLAN_ALIASES.get(raw)
+    if alias in GEMINI_PLANS:
+        plan_key = alias
+        plan_mode = "manual"
+    else:
+        plan_key = _probe_gemini_plan(now, cache, force=force_plan)
+        plan_mode = "auto"
+        # 429 枠切れしていないのに現プランの5時間目安を大きく超えて動いている場合は上位プランへ自動補正
+        if active_reset is None and u5 > GEMINI_PLANS[plan_key]["5h"] * 1.25:
+            idx = GEMINI_PLAN_ORDER.index(plan_key)
+            for cand in GEMINI_PLAN_ORDER[idx + 1:]:
+                plan_key = cand
+                if u5 <= GEMINI_PLANS[cand]["5h"] * 1.25:
+                    break
+
+    spec = GEMINI_PLANS[plan_key]
+    def _cap(cfg_key, default_val):
+        v = cfg.get(cfg_key)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+        return float(default_val)
+
+    cap_5h = _cap("gemini_5h_usd", spec["5h"])
+    cap_w = _cap("gemini_week_usd", spec["week"])
+    cap_m = _cap("gemini_month_usd", spec["month"])
+    return plan_key, plan_mode, spec["label"], cap_5h, cap_w, cap_m
+
+
+def collect_gemini(now, cfg, cache=None, force_plan=False):
     if cache is None:
         cache = {}
-    cap_5h = float(cfg.get("gemini_5h_usd") or 25.0)
-    cap_w = float(cfg.get("gemini_week_usd") or 65.0)
-    cap_m = float(cfg.get("gemini_month_usd") or 200.0)
 
     cutoff_7d = now - 7 * 86400
     cutoff_30d = now - 30 * 86400
@@ -970,6 +1075,12 @@ def collect_gemini(now, cfg, cache=None):
     win_start = win["win_start"]
     win_end = win["win_end"]
 
+    plan_key, plan_mode, plan_label, cap_5h, cap_w, cap_m = _resolve_gemini_plan(
+        now, cfg, cache, u5, active_reset, force_plan=force_plan
+    )
+    plan_tag = f" ({plan_label}" + (T("・自動)", " · auto)") if plan_mode == "auto" else ")")
+    plan_hint = T("••• からプラン変更可", "change plan in ••• menu")
+
     # 2. AOS の Gemini API 記録（トークン表示に加算）
     gp = os.path.join(HOME, ".config", "aos", "gemini-usage.jsonl")
     for line in read_tail_lines(gp, max_bytes=2_000_000):
@@ -1004,8 +1115,8 @@ def collect_gemini(now, cfg, cache=None):
             "percent": 0,
             "center": "0%",
             "status": "danger",
-            "tip1": T(f"Gemini  5時間 上限中{rst_s}", f"Gemini  5h: Limit reached{rst_s}"),
-            "tip2": T(f"消費 {fmt_tokens(t5)} トークン（目安 ${u5:.2f}）", f"{fmt_tokens(t5)} tokens used (est. ${u5:.2f})") + CLICK,
+            "tip1": T(f"Gemini{plan_tag}  5時間 上限中{rst_s}", f"Gemini{plan_tag}  5h: Limit reached{rst_s}"),
+            "tip2": T(f"消費 {fmt_tokens(t5)} トークン（目安 ${u5:.2f}・{plan_hint}）", f"{fmt_tokens(t5)} tokens used (est. ${u5:.2f} · {plan_hint})") + CLICK,
         }
     elif not win["active"]:
         view_5h = {
@@ -1015,8 +1126,8 @@ def collect_gemini(now, cfg, cache=None):
             "percent": 100,
             "center": "100%",
             "status": "ok",
-            "tip1": T(f"Gemini  5時間 残り 100%（リセット済み・目安 $0.00 / ${cap_5h:.0f}）", f"Gemini  5h: 100% left (reset · est. $0.00 / ${cap_5h:.0f})"),
-            "tip2": T("消費 0 トークン（config.json で目安を補正可）", "0 tokens used (tune caps in config.json)") + CLICK,
+            "tip1": T(f"Gemini{plan_tag}  5時間 残り 100%（リセット済み・目安 $0.00 / ${cap_5h:.0f}）", f"Gemini{plan_tag}  5h: 100% left (reset · est. $0.00 / ${cap_5h:.0f})"),
+            "tip2": T(f"消費 0 トークン（{plan_hint}）", f"0 tokens used ({plan_hint})") + CLICK,
         }
     else:
         used_pct = min(100.0, (u5 / cap_5h) * 100.0) if cap_5h > 0 else 0.0
@@ -1029,8 +1140,8 @@ def collect_gemini(now, cfg, cache=None):
             "percent": rem_5h,
             "center": f"{rem_5h}%",
             "status": rem_status(rem_5h),
-            "tip1": T(f"Gemini  5時間 残り 約{rem_5h}%（{rst_s}目安 ${u5:.2f} / ${cap_5h:.0f}）", f"Gemini  5h: ~{rem_5h}% left ({rst_s}est. ${u5:.2f} / ${cap_5h:.0f})"),
-            "tip2": T(f"消費 {fmt_tokens(t5)} トークン（config.json で目安を補正可）", f"{fmt_tokens(t5)} tokens used (tune caps in config.json)") + CLICK,
+            "tip1": T(f"Gemini{plan_tag}  5時間 残り 約{rem_5h}%（{rst_s}目安 ${u5:.2f} / ${cap_5h:.0f}）", f"Gemini{plan_tag}  5h: ~{rem_5h}% left ({rst_s}est. ${u5:.2f} / ${cap_5h:.0f})"),
+            "tip2": T(f"消費 {fmt_tokens(t5)} トークン（{plan_hint}）", f"{fmt_tokens(t5)} tokens used ({plan_hint})") + CLICK,
         }
 
     def make_view(key, sub, title, usd, cap, tok):
@@ -1043,8 +1154,8 @@ def collect_gemini(now, cfg, cache=None):
             "percent": rem,
             "center": f"{rem}%",
             "status": rem_status(rem),
-            "tip1": T(f"Gemini  {title} 残り 約{rem}%（目安 ${usd:.2f} / ${cap:.0f}）", f"Gemini  {title}: ~{rem}% left (est. ${usd:.2f} / ${cap:.0f})"),
-            "tip2": T(f"消費 {fmt_tokens(tok)} トークン（config.json で目安を補正可）", f"{fmt_tokens(tok)} tokens used (tune caps in config.json)") + CLICK,
+            "tip1": T(f"Gemini{plan_tag}  {title} 残り 約{rem}%（目安 ${usd:.2f} / ${cap:.0f}）", f"Gemini{plan_tag}  {title}: ~{rem}% left (est. ${usd:.2f} / ${cap:.0f})"),
+            "tip2": T(f"消費 {fmt_tokens(tok)} トークン（{plan_hint}）", f"{fmt_tokens(tok)} tokens used ({plan_hint})") + CLICK,
         }
 
     # 一番小さい時間軸（5時間 → 週間 → 月間）の順に並べる
@@ -1053,7 +1164,14 @@ def collect_gemini(now, cfg, cache=None):
         make_view("week", T("週間", "Week"), T("週間", "Week"), u7, cap_w, t7),
         make_view("month", T("月間", "Month"), T("月間", "Month"), u30, cap_m, t30),
     ]
-    return {"id": "gemini", "label": "Gemini", "views": views}
+    return {
+        "id": "gemini",
+        "label": "Gemini",
+        "plan": plan_key,
+        "plan_mode": plan_mode,
+        "plan_label": plan_label,
+        "views": views,
+    }
 
 def collect_opencode_db(now):
     dbp = os.path.join(HOME, ".local", "share", "opencode", "opencode.db")
@@ -1217,7 +1335,7 @@ def main():
     items = [
         collect_claude(now, aos, cache, cfg),
         collect_codex(now, cache),
-        collect_gemini(now, cfg, cache),
+        collect_gemini(now, cfg, cache, force_plan=('--refresh-plan' in sys.argv)),
         collect_opencode(now, aos, cfg),
     ] + collect_custom(cfg)
     save_cache(cache)
