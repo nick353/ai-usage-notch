@@ -8,6 +8,7 @@ Claude Code のログイン情報で Anthropic の使用量の窓口に聞く（
 import glob
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import urllib.request
@@ -736,52 +737,238 @@ def gemini_model_rates(model):
     return (3.0, 0.15, 15.0)
 
 
-def collect_gemini(now, cfg):
-    cap_5h = float(cfg.get("gemini_5h_usd") or 20.0)
+def _gemini_transcript_paths():
+    """Antigravity（CLI・T3 Code 経由の両方）の会話ログ transcript.jsonl を重複なしで返す。"""
+    pats = [
+        os.path.join(HOME, ".gemini", "antigravity*", "brain", "*", ".system_generated", "logs", "transcript.jsonl"),
+        os.path.join(HOME, ".t3", "userdata", "providers", "antigravity", "*", "antigravity-acp", "brain", "*", ".system_generated", "logs", "transcript.jsonl"),
+    ]
+    seen = set()
+    out = []
+    for pat in pats:
+        for fp in glob.glob(pat):
+            rp = os.path.realpath(fp)
+            if rp not in seen:
+                seen.add(rp)
+                out.append(fp)
+    return out
+
+
+def _gemini_log_paths():
+    """Antigravity（CLI・T3 Code 経由の両方）の実行ログを重複なしで返す。"""
+    pats = [
+        os.path.join(HOME, ".gemini", "antigravity*", "log", "*.log"),
+        os.path.join(HOME, ".t3", "userdata", "providers", "antigravity", "*", "antigravity-acp", "log", "*.log"),
+    ]
+    seen = set()
+    out = []
+    for pat in pats:
+        for fp in glob.glob(pat):
+            rp = os.path.realpath(fp)
+            if rp not in seen:
+                seen.add(rp)
+                out.append(fp)
+    return out
+
+
+_GEMINI_429_RE = re.compile(
+    r"^E(\d{2})(\d{2}) (\d{2}):(\d{2}):(\d{2})\.\d+.*Individual quota reached.*Resets in ((?:\d+d)?(?:\d+h)?(?:\d+m)?(?:\d+s)?)"
+)
+
+
+def _parse_duration_sec(s):
+    """'2h24m35s' のような残り時間表記を秒数に変換する。"""
+    if not s:
+        return None
+    total = 0
+    for val, unit in re.findall(r"(\d+)([dhms])", s):
+        n = int(val)
+        if unit == "d":
+            total += n * 86400
+        elif unit == "h":
+            total += n * 3600
+        elif unit == "m":
+            total += n * 60
+        elif unit == "s":
+            total += n
+    return total if total > 0 else None
+
+
+def _collect_gemini_quota_resets(now, cache):
+    """Antigravity の実行ログから 429 枠切れのリセット確定時刻を拾う。
+    戻り値: (active_reset_ts or None, sorted known_reset_ts list)"""
+    cutoff = now - 36 * 3600
+    log_cache = cache.setdefault("gemini_429_v1", {})
+    active_keys = set()
+    pairs = []
+
+    for fp in _gemini_log_paths():
+        try:
+            st = os.stat(fp)
+        except Exception:
+            continue
+        if st.st_mtime < cutoff:
+            continue
+        active_keys.add(fp)
+        sig = f"{int(st.st_mtime)}:{st.st_size}"
+        ent = log_cache.get(fp)
+        if isinstance(ent, dict) and ent.get("sig") == sig:
+            rows = ent.get("rows") or []
+        else:
+            rows = []
+            year = datetime.fromtimestamp(st.st_mtime).year
+            try:
+                with open(fp, encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if "Individual quota reached" not in line or "Resets in" not in line:
+                            continue
+                        m = _GEMINI_429_RE.match(line)
+                        if not m:
+                            continue
+                        mo, dy, hh, mm, ss = (int(m.group(i)) for i in range(1, 6))
+                        dur = _parse_duration_sec(m.group(6))
+                        if not dur:
+                            continue
+                        try:
+                            dt = datetime(year, mo, dy, hh, mm, ss)
+                            if dt.timestamp() > now + 86400:
+                                dt = datetime(year - 1, mo, dy, hh, mm, ss)
+                            log_ts = dt.timestamp()
+                            rows.append([log_ts, log_ts + dur])
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            log_cache[fp] = {"sig": sig, "rows": rows}
+        for log_ts, reset_ts in rows:
+            pairs.append((float(log_ts), float(reset_ts)))
+
+    for k in list(log_cache.keys()):
+        if k not in active_keys:
+            del log_cache[k]
+
+    if not pairs:
+        return None, []
+
+    pairs.sort(key=lambda x: x[0])
+    active_reset = None
+    for _, reset_ts in pairs:
+        if reset_ts > now:
+            active_reset = reset_ts
+
+    # 同じ枠の複数429（数秒の揺れ）を1つの確定リセット時刻にまとめる
+    raw_resets = sorted(r for _, r in pairs)
+    known = []
+    for r in raw_resets:
+        if known and abs(r - known[-1]) <= 600:
+            known[-1] = r
+        else:
+            known.append(r)
+    return active_reset, known
+
+
+def _compute_gemini_5h_window(events, now, known_resets):
+    """Gemini の5時間枠を固定5時間ブロック（使い始めた瞬間から5時間後にリセット）で集計する。
+    429ログから得た確定リセット時刻があれば終了時刻をそこに合わせる。"""
+    five_h = 5 * 3600
+    events_sorted = sorted(events, key=lambda x: x[0])
+    win_start = None
+    win_end = None
+    u5 = 0.0
+    t5 = 0
+
+    for ts, usd, tok in events_sorted:
+        if win_start is None or ts >= win_end:
+            win_start = ts
+            win_end = ts + five_h
+            u5 = 0.0
+            t5 = 0
+            for r in known_resets:
+                if win_start < r <= win_end + 600:
+                    win_end = r
+                    break
+        u5 += usd
+        t5 += tok
+
+    if win_start is None or now >= win_end:
+        return {"active": False, "win_start": None, "win_end": None, "usd": 0.0, "tok": 0}
+    return {"active": True, "win_start": win_start, "win_end": win_end, "usd": u5, "tok": t5}
+
+
+def collect_gemini(now, cfg, cache=None):
+    if cache is None:
+        cache = {}
+    cap_5h = float(cfg.get("gemini_5h_usd") or 25.0)
     cap_w = float(cfg.get("gemini_week_usd") or 65.0)
     cap_m = float(cfg.get("gemini_month_usd") or 200.0)
 
-    cutoff_5h = now - 5 * 3600
     cutoff_7d = now - 7 * 86400
     cutoff_30d = now - 30 * 86400
-    t5 = t7 = t30 = 0
-    u5 = u7 = u30 = 0.0
+    t7 = t30 = 0
+    u7 = u30 = 0.0
+    events = []
 
-    # 1. Antigravity の会話ログ（定額枠の消費分）
-    pat = os.path.join(HOME, ".gemini", "antigravity-cli", "brain", "*", ".system_generated", "logs", "transcript.jsonl")
-    for fp in glob.glob(pat):
+    # 1. Antigravity の会話ログ（CLI・T3 Code 経由の定額枠消費分）
+    tx_cache = cache.setdefault("gemini_tx_v1", {})
+    active_keys = set()
+    for fp in _gemini_transcript_paths():
         try:
-            if os.path.getmtime(fp) < cutoff_30d:
-                continue
-            with open(fp, encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    if "_tokens" not in line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except Exception:
-                        continue
-                    it = int(d.get("input_tokens") or 0)
-                    ct = int(d.get("cache_read_tokens") or 0)
-                    ot = int(d.get("output_tokens") or 0)
-                    tok = it + ct + ot
-                    if tok <= 0:
-                        continue
-                    ts = parse_iso(d.get("created_at"))
-                    if ts is None or ts < cutoff_30d:
-                        continue
-                    ri, rc, ro = gemini_model_rates(d.get("model"))
-                    usd = (it * ri + ct * rc + ot * ro) / 1_000_000.0
-                    t30 += tok
-                    u30 += usd
-                    if ts >= cutoff_7d:
-                        t7 += tok
-                        u7 += usd
-                    if ts >= cutoff_5h:
-                        t5 += tok
-                        u5 += usd
+            st = os.stat(fp)
         except Exception:
-            pass
+            continue
+        if st.st_mtime < cutoff_30d:
+            continue
+        active_keys.add(fp)
+        sig = f"{int(st.st_mtime)}:{st.st_size}"
+        ent = tx_cache.get(fp)
+        if isinstance(ent, dict) and ent.get("sig") == sig:
+            rows = ent.get("rows") or []
+        else:
+            rows = []
+            try:
+                with open(fp, encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if "_tokens" not in line:
+                            continue
+                        try:
+                            d = json.loads(line)
+                        except Exception:
+                            continue
+                        it = int(d.get("input_tokens") or 0)
+                        ct = int(d.get("cache_read_tokens") or 0)
+                        ot = int(d.get("output_tokens") or 0)
+                        tok = it + ct + ot
+                        if tok <= 0:
+                            continue
+                        ts = parse_iso(d.get("created_at"))
+                        if ts is None or ts < cutoff_30d:
+                            continue
+                        ri, rc, ro = gemini_model_rates(d.get("model"))
+                        usd = (it * ri + ct * rc + ot * ro) / 1_000_000.0
+                        rows.append([ts, usd, tok])
+            except Exception:
+                pass
+            tx_cache[fp] = {"sig": sig, "rows": rows}
+        for ts, usd, tok in rows:
+            if ts < cutoff_30d:
+                continue
+            t30 += tok
+            u30 += usd
+            if ts >= cutoff_7d:
+                t7 += tok
+                u7 += usd
+            events.append((ts, usd, tok))
+
+    for k in list(tx_cache.keys()):
+        if k not in active_keys:
+            del tx_cache[k]
+
+    active_reset, known_resets = _collect_gemini_quota_resets(now, cache)
+    win = _compute_gemini_5h_window(events, now, known_resets)
+    u5 = win["usd"]
+    t5 = win["tok"]
+    win_start = win["win_start"]
+    win_end = win["win_end"]
 
     # 2. AOS の Gemini API 記録（トークン表示に加算）
     gp = os.path.join(HOME, ".config", "aos", "gemini-usage.jsonl")
@@ -804,8 +991,47 @@ def collect_gemini(now, cfg):
             t30 += tok
             if ts >= cutoff_7d:
                 t7 += tok
-            if ts >= cutoff_5h:
+            if win_start is not None and ts >= win_start:
                 t5 += tok
+
+    # 5時間ビュー: 429 枠切れ中なら公式どおり 0%＋戻る時刻、通常時は固定5時間枠で計算
+    if active_reset is not None:
+        rst_s = T(f"（{fmt_jst(active_reset)} に戻る）", f" (resets {fmt_jst(active_reset)})")
+        view_5h = {
+            "key": "5h",
+            "sub": T("5時間", "5h"),
+            "mode": "percent",
+            "percent": 0,
+            "center": "0%",
+            "status": "danger",
+            "tip1": T(f"Gemini  5時間 上限中{rst_s}", f"Gemini  5h: Limit reached{rst_s}"),
+            "tip2": T(f"消費 {fmt_tokens(t5)} トークン（目安 ${u5:.2f}）", f"{fmt_tokens(t5)} tokens used (est. ${u5:.2f})") + CLICK,
+        }
+    elif not win["active"]:
+        view_5h = {
+            "key": "5h",
+            "sub": T("5時間", "5h"),
+            "mode": "percent",
+            "percent": 100,
+            "center": "100%",
+            "status": "ok",
+            "tip1": T(f"Gemini  5時間 残り 100%（リセット済み・目安 $0.00 / ${cap_5h:.0f}）", f"Gemini  5h: 100% left (reset · est. $0.00 / ${cap_5h:.0f})"),
+            "tip2": T("消費 0 トークン（config.json で目安を補正可）", "0 tokens used (tune caps in config.json)") + CLICK,
+        }
+    else:
+        used_pct = min(100.0, (u5 / cap_5h) * 100.0) if cap_5h > 0 else 0.0
+        rem_5h = max(0, round(100.0 - used_pct))
+        rst_s = T(f"{fmt_jst(win_end)} に戻る・", f"resets {fmt_jst(win_end)} · ") if win_end else ""
+        view_5h = {
+            "key": "5h",
+            "sub": T("5時間", "5h"),
+            "mode": "percent",
+            "percent": rem_5h,
+            "center": f"{rem_5h}%",
+            "status": rem_status(rem_5h),
+            "tip1": T(f"Gemini  5時間 残り 約{rem_5h}%（{rst_s}目安 ${u5:.2f} / ${cap_5h:.0f}）", f"Gemini  5h: ~{rem_5h}% left ({rst_s}est. ${u5:.2f} / ${cap_5h:.0f})"),
+            "tip2": T(f"消費 {fmt_tokens(t5)} トークン（config.json で目安を補正可）", f"{fmt_tokens(t5)} tokens used (tune caps in config.json)") + CLICK,
+        }
 
     def make_view(key, sub, title, usd, cap, tok):
         used_pct = min(100.0, (usd / cap) * 100.0) if cap > 0 else 0.0
@@ -823,12 +1049,11 @@ def collect_gemini(now, cfg):
 
     # 一番小さい時間軸（5時間 → 週間 → 月間）の順に並べる
     views = [
-        make_view("5h", T("5時間", "5h"), T("5時間", "5h"), u5, cap_5h, t5),
+        view_5h,
         make_view("week", T("週間", "Week"), T("週間", "Week"), u7, cap_w, t7),
         make_view("month", T("月間", "Month"), T("月間", "Month"), u30, cap_m, t30),
     ]
     return {"id": "gemini", "label": "Gemini", "views": views}
-
 
 def collect_opencode_db(now):
     dbp = os.path.join(HOME, ".local", "share", "opencode", "opencode.db")
@@ -992,14 +1217,15 @@ def main():
     items = [
         collect_claude(now, aos, cache, cfg),
         collect_codex(now, cache),
-        collect_gemini(now, cfg),
+        collect_gemini(now, cfg, cache),
         collect_opencode(now, aos, cfg),
     ] + collect_custom(cfg)
     save_cache(cache)
     present = {
         "claude": os.path.isdir(os.path.join(HOME, ".claude")),
         "codex": os.path.isdir(os.path.join(HOME, ".codex")),
-        "gemini": bool(glob.glob(os.path.join(HOME, ".gemini", "antigravity-cli", "brain")))
+        "gemini": bool(glob.glob(os.path.join(HOME, ".gemini", "antigravity*", "brain")))
+        or bool(glob.glob(os.path.join(HOME, ".t3", "userdata", "providers", "antigravity", "*", "antigravity-acp", "brain")))
         or os.path.isfile(os.path.join(HOME, ".config", "aos", "gemini-usage.jsonl")),
         "opencode": os.path.isfile(os.path.join(HOME, ".local", "share", "opencode", "opencode.db"))
         or aos.get("go_30d", 0) > 0,
