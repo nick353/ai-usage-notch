@@ -734,6 +734,8 @@ def gemini_model_rates(model):
         return (0.30, 0.03, 2.50)
     if "hydrogen" in m or "argon" in m:
         return (1.25, 0.125, 10.0)
+    if "carbon" in m:
+        return (4.0, 0.20, 20.0)
     # neon / pro 系の既定（Gemini 4 Neon 公式単価: 入力$3・キャッシュ$0.15・出力$15）
     return (3.0, 0.15, 15.0)
 
@@ -849,13 +851,15 @@ def _collect_gemini_quota_resets(now, cache):
             del log_cache[k]
 
     if not pairs:
-        return None, []
+        return None, None, []
 
     pairs.sort(key=lambda x: x[0])
     active_reset = None
-    for _, reset_ts in pairs:
+    active_429_at = None
+    for log_ts, reset_ts in pairs:
         if reset_ts > now:
             active_reset = reset_ts
+            active_429_at = log_ts
 
     # 同じ枠の複数429（数秒の揺れ）を1つの確定リセット時刻にまとめる
     raw_resets = sorted(r for _, r in pairs)
@@ -865,7 +869,7 @@ def _collect_gemini_quota_resets(now, cache):
             known[-1] = r
         else:
             known.append(r)
-    return active_reset, known
+    return active_reset, active_429_at, known
 
 
 def _compute_gemini_5h_window(events, now, known_resets):
@@ -1068,7 +1072,11 @@ def collect_gemini(now, cfg, cache=None, force_plan=False):
         if k not in active_keys:
             del tx_cache[k]
 
-    active_reset, known_resets = _collect_gemini_quota_resets(now, cache)
+    active_reset, active_429_at, known_resets = _collect_gemini_quota_resets(now, cache)
+    latest_ev_ts = max((ts for ts, _, _ in events), default=0.0)
+    if active_reset is not None and active_429_at is not None and latest_ev_ts > active_429_at + 10:
+        # 429 枠切れのあとに正常な応答が返っている（プラン変更等で解除済み）
+        active_reset = None
     win = _compute_gemini_5h_window(events, now, known_resets)
     u5 = win["usd"]
     t5 = win["tok"]
