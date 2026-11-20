@@ -71,10 +71,10 @@ Commands run with your login shell (`bash -l`), so your `PATH` and environment v
 |---|---|---|
 | Claude | Anthropic's usage endpoint, using your existing Claude Code login (every 5 min at most). Token counts from `~/.claude/projects/` | 5-hour and weekly limit left, tokens in the last 5h / 24h |
 | Codex | The latest `rate_limits` in `~/.codex/sessions/` | Weekly limit left, extra credits, tokens |
-| Gemini | Antigravity transcripts in `~/.gemini/antigravity-cli/` | Estimated % left against the caps in `config.json` |
+| Gemini | Antigravity CLI (`agy`) official `/usage` (cached every 5 min) + local transcripts | Official 5h & weekly % left, bundled Claude/GPT pool, tokens |
 | OpenCode Go | `~/.local/share/opencode/opencode.db` | Spend vs. the caps in `config.json` |
 
-Gemini and OpenCode do not publish a remaining-% number, so those are estimates. Adjust the caps in `config.json` to match your plan.
+Gemini 5h and weekly percentages come directly from `agy` `/usage` (falling back to local estimates if unavailable). OpenCode Go uses estimates against the caps in `config.json`.
 
 ## Settings
 

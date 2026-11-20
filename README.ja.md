@@ -71,10 +71,10 @@ Claude の枠を初めて読むとき、macOS が「security がキーチェー�
 |---|---|---|
 | Claude | Claude Code のログインを使って Anthropic の使用量の窓口に聞く（5分に1回まで）。使った量は `~/.claude/projects/` | 5時間・週の枠の残り、5時間・24時間の使用量 |
 | Codex | `~/.codex/sessions/` の最新の `rate_limits` | 週の枠の残り、追加クレジット、使用量 |
-| Gemini | `~/.gemini/antigravity-cli/` の記録 | `config.json` の目安に対する残り（推定） |
+| Gemini | Antigravity CLI（`agy`）の公式 `/usage`（5分に1回キャッシュ）＋ログ | 5時間・週の公式残り%、契約内の Claude/GPT 別枠、使用量 |
 | OpenCode Go | `~/.local/share/opencode/opencode.db` | `config.json` の目安に対する使った額 |
 
-Gemini と OpenCode は「残り%」を公開していないので、推定です。`config.json` の目安を自分のプランに合わせてください。
+Gemini の5時間・週は `agy` の公式 `/usage` から実測値を読み、取れないときだけログから推定します。OpenCode Go は推定なので、`config.json` の目安を自分のプランに合わせてください。
 
 ## 設定
 

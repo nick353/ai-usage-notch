@@ -9,9 +9,15 @@ import glob
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import sqlite3
 import subprocess
+try:
+    import pty
+except Exception:
+    pty = None
 import urllib.request
 import sys
 import time
@@ -939,6 +945,242 @@ def _find_agy_bin():
     return None
 
 
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-Za-z]|\x1b[=>]"
+)
+
+
+def _parse_agy_quota_block(block, now):
+    """Models & Quota の1グループ分から Weekly / Five Hour の残り%とリセット時刻を抜く。"""
+    def _extract(sub):
+        if not sub:
+            return None, None
+        m_pct = re.search(r"(\d+(?:\.\d+)?)\s*%", sub)
+        rem = max(0.0, min(100.0, float(m_pct.group(1)))) if m_pct else None
+        m_rst = re.search(r"Refreshes in\s+([0-9dhms ]+)", sub, re.I)
+        resets_at = None
+        if m_rst:
+            dur = _parse_duration_sec(m_rst.group(1).strip())
+            if dur:
+                resets_at = now + dur
+        return rem, resets_at
+
+    idx_w = block.find("Weekly Limit Remaining")
+    idx_5 = block.find("Five Hour Limit Remaining")
+    w_sub = ""
+    h5_sub = ""
+    if idx_w >= 0:
+        end_w = idx_5 if idx_5 > idx_w else len(block)
+        w_sub = block[idx_w:end_w]
+    if idx_5 >= 0:
+        end_5 = idx_w if idx_w > idx_5 else len(block)
+        h5_sub = block[idx_5:end_5]
+    w_rem, w_rst = _extract(w_sub)
+    h5_rem, h5_rst = _extract(h5_sub)
+    return w_rem, w_rst, h5_rem, h5_rst
+
+
+def _parse_agy_usage_output(raw_text, now):
+    """Antigravity CLI (`agy`) の `/usage` 画面出力から公式の残り%・リセット時刻・プラン名を抜く。"""
+    if not raw_text:
+        return None
+    clean = _ANSI_ESCAPE_RE.sub(" ", raw_text)
+    clean = re.sub(r"[ \t]+", " ", clean)
+
+    plan_name = None
+    m_plan = re.search(r"[^\s@]+@[^\s@]+\s+\(([^()\r\n]{2,40})\)", clean)
+    if m_plan:
+        plan_name = m_plan.group(1).strip()
+
+    idx_gem = clean.find("GEMINI MODELS")
+    if idx_gem < 0:
+        return None
+    idx_cg = clean.find("CLAUDE AND GPT MODELS", idx_gem)
+    idx_tail = clean.find("Within each group", idx_gem)
+
+    gem_end = len(clean)
+    for cand in (idx_cg, idx_tail):
+        if cand > idx_gem and cand < gem_end:
+            gem_end = cand
+    gem_block = clean[idx_gem:gem_end]
+    g_w_rem, g_w_rst, g_5_rem, g_5_rst = _parse_agy_quota_block(gem_block, now)
+
+    cg_w_rem = cg_w_rst = cg_5_rem = cg_5_rst = None
+    if idx_cg >= 0:
+        cg_end = idx_tail if idx_tail > idx_cg else len(clean)
+        cg_block = clean[idx_cg:cg_end]
+        cg_w_rem, cg_w_rst, cg_5_rem, cg_5_rst = _parse_agy_quota_block(cg_block, now)
+
+    if g_w_rem is None and g_5_rem is None:
+        return None
+
+    return {
+        "at": now,
+        "plan_name": plan_name,
+        "gemini_5h_rem": g_5_rem,
+        "gemini_5h_resets_at": g_5_rst,
+        "gemini_week_rem": g_w_rem,
+        "gemini_week_resets_at": g_w_rst,
+        "cg_5h_rem": cg_5_rem,
+        "cg_5h_resets_at": cg_5_rst,
+        "cg_week_rem": cg_w_rem,
+        "cg_week_resets_at": cg_w_rst,
+    }
+
+
+def _find_agy_trusted_cwd():
+    """agy が追加の信頼確認を出さずに開ける、既存の信頼済みフォルダを1つ選ぶ。"""
+    settings_path = os.path.join(HOME, ".gemini", "antigravity-cli", "settings.json")
+    try:
+        with open(settings_path, encoding="utf-8") as f:
+            st = json.load(f)
+        for p in st.get("trustedWorkspaces") or []:
+            if isinstance(p, str) and os.path.isdir(p):
+                return p
+    except Exception:
+        pass
+    last_conv = os.path.join(HOME, ".gemini", "antigravity-cli", "cache", "last_conversations.json")
+    try:
+        with open(last_conv, encoding="utf-8") as f:
+            lc = json.load(f)
+        if isinstance(lc, dict):
+            for p in lc.keys():
+                if isinstance(p, str) and os.path.isdir(p) and "/tmp" not in p and "antigravity-tmp" not in p:
+                    return p
+    except Exception:
+        pass
+    return BASE
+
+
+def _probe_gemini_usage(now, cache, cfg, force=False):
+    """公式 CLI (`agy`) の `/usage` 画面を PTY で読み、公式の 5時間/週間 残り% を取得する（既定5分キャッシュ）。"""
+    if cfg.get("gemini_usage_official") is False or pty is None:
+        return None
+
+    c = cache.get("gemini_official_usage_v1") or {}
+    cached_data = c.get("data") if isinstance(c.get("data"), dict) else None
+    interval = max(60, int(cfg.get("gemini_usage_interval_sec") or 300))
+
+    if not force and cached_data and c.get("at"):
+        rst_passed = False
+        for rk in ("gemini_5h_resets_at", "gemini_week_resets_at"):
+            rv = cached_data.get(rk)
+            if isinstance(rv, (int, float)) and rv > 0 and now >= rv:
+                rst_passed = True
+                break
+        if not rst_passed and (now - float(c["at"])) < interval:
+            return cached_data
+
+    if not force and c.get("retry_after") and now < float(c["retry_after"]):
+        if cached_data and c.get("at") and (now - float(c["at"])) < 3600:
+            return cached_data
+        return None
+
+    agy = _find_agy_bin()
+    if not agy:
+        cache["gemini_official_usage_v1"] = {**c, "retry_after": now + 600}
+        return cached_data if (cached_data and c.get("at") and (now - float(c["at"])) < 3600) else None
+
+    master = None
+    proc = None
+    buf = b""
+    try:
+        master, slave = pty.openpty()
+        env = os.environ.copy()
+        env["TERM"] = "xterm-256color"
+        env["COLUMNS"] = "120"
+        env["LINES"] = "40"
+        env["AGY_BARE"] = "1"
+        proc = subprocess.Popen(
+            [agy],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env=env,
+            cwd=_find_agy_trusted_cwd(),
+            close_fds=True,
+            start_new_session=True,
+        )
+        os.close(slave)
+
+        t0 = time.time()
+        deadline = t0 + 12.0
+        sent = 0
+        t_sent = 0.0
+        while time.time() < deadline:
+            r, _, _ = select.select([master], [], [], 0.1)
+            if r:
+                try:
+                    chunk = os.read(master, 65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                except OSError:
+                    break
+            txt = _ANSI_ESCAPE_RE.sub(" ", buf.decode("utf-8", errors="ignore"))
+            if "Do you trust the contents" in txt:
+                break
+            if sent == 0:
+                if "? for shortcuts" in txt or "esc to dismiss" in txt:
+                    time.sleep(0.25)
+                    os.write(master, b"/usage")
+                    time.sleep(0.2)
+                    os.write(master, b"\r")
+                    sent = 1
+                    t_sent = time.time()
+                elif "not signed in" in txt.lower() and "signing in" not in txt.lower() and (time.time() - t0) > 3.5:
+                    break
+            else:
+                if "GEMINI MODELS" in txt and "Five Hour Limit Remaining" in txt and (
+                    "Within each group" in txt or "Quota available" in txt or txt.count("%") >= 2
+                ):
+                    end2 = time.time() + 0.35
+                    while time.time() < end2:
+                        r2, _, _ = select.select([master], [], [], 0.05)
+                        if r2:
+                            try:
+                                c2 = os.read(master, 65536)
+                                if not c2:
+                                    break
+                                buf += c2
+                            except OSError:
+                                break
+                    break
+                if sent == 1 and (time.time() - t_sent) > 1.5 and "GEMINI MODELS" not in txt:
+                    os.write(master, b"\r")
+                    sent = 2
+    except Exception:
+        pass
+    finally:
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=0.8)
+            except Exception:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        if master is not None:
+            try:
+                os.close(master)
+            except Exception:
+                pass
+
+    parsed = _parse_agy_usage_output(buf.decode("utf-8", errors="ignore"), now)
+    if parsed:
+        cache["gemini_official_usage_v1"] = {"at": now, "data": parsed}
+        return parsed
+
+    cache["gemini_official_usage_v1"] = {**c, "retry_after": now + 300}
+    if cached_data and c.get("at") and (now - float(c["at"])) < 3600:
+        return cached_data
+    return None
+
+
 def _probe_gemini_plan(now, cache, force=False):
     """公式 CLI の `agy models` から現在の Google AI プランを推定する（30分キャッシュ）。"""
     c = cache.get("gemini_plan_probe_v1") or {}
@@ -1083,10 +1325,37 @@ def collect_gemini(now, cfg, cache=None, force_plan=False):
     win_start = win["win_start"]
     win_end = win["win_end"]
 
-    plan_key, plan_mode, plan_label, cap_5h, cap_w, cap_m = _resolve_gemini_plan(
-        now, cfg, cache, u5, active_reset, force_plan=force_plan
+    official = _probe_gemini_usage(now, cache, cfg, force=force_plan)
+    if official and official.get("plan_name"):
+        pname = official["plan_name"]
+        pl = pname.lower()
+        if "ultra" in pl:
+            plan_key = "ultra_5x"
+        elif "pro" in pl:
+            plan_key = "pro"
+        elif "plus" in pl:
+            plan_key = "plus"
+        elif "free" in pl:
+            plan_key = "free"
+        else:
+            plan_key = "pro"
+        plan_mode = "official"
+        plan_label = pname
+        spec = GEMINI_PLANS[plan_key]
+        cap_5h = float(cfg.get("gemini_5h_usd") or spec["5h"])
+        cap_w = float(cfg.get("gemini_week_usd") or spec["week"])
+        cap_m = float(cfg.get("gemini_month_usd") or spec["month"])
+    else:
+        plan_key, plan_mode, plan_label, cap_5h, cap_w, cap_m = _resolve_gemini_plan(
+            now, cfg, cache, u5, active_reset, force_plan=force_plan
+        )
+
+    if official:
+        plan_mode = "official"
+    plan_tag = f" ({plan_label}" + (
+        T("・公式)", " · official)") if official else (T("・自動)", " · auto)") if plan_mode == "auto" else ")")
     )
-    plan_tag = f" ({plan_label}" + (T("・自動)", " · auto)") if plan_mode == "auto" else ")")
+    est_tag = f" ({plan_label}" + (T("・目安)", " · est.)") if official else (T("・自動)", " · auto)") if plan_mode == "auto" else ")"))
     plan_hint = T("••• からプラン変更可", "change plan in ••• menu")
 
     # 2. AOS の Gemini API 記録（トークン表示に加算）
@@ -1113,8 +1382,29 @@ def collect_gemini(now, cfg, cache=None, force_plan=False):
             if win_start is not None and ts >= win_start:
                 t5 += tok
 
-    # 5時間ビュー: 429 枠切れ中なら公式どおり 0%＋戻る時刻、通常時は固定5時間枠で計算
-    if active_reset is not None:
+    rec_note = T(f"記録 {fmt_jst(official['at'])}", f"recorded {fmt_jst(official['at'])}") if (official and official.get("at")) else ""
+
+    # 5時間ビュー: 公式 `/usage` が取れたら実測値を最優先、無いときだけ429ログ・固定5時間枠の推計
+    if official and official.get("gemini_5h_rem") is not None:
+        rem_f = max(0.0, min(100.0, float(official["gemini_5h_rem"])))
+        used_f = max(0.0, 100.0 - rem_f)
+        rem_5h = round(rem_f)
+        rst = official.get("gemini_5h_resets_at")
+        rst_s = T(f"（{fmt_jst(rst)} に戻る）", f" (resets {fmt_jst(rst)})") if rst else ""
+        parts = [T(f"消費 {used_f:.1f}%", f"{used_f:.1f}% used"), T(f"5時間 {fmt_tokens(t5)}", f"5h {fmt_tokens(t5)} tokens")]
+        if rec_note:
+            parts.append(rec_note)
+        view_5h = {
+            "key": "5h",
+            "sub": T("5時間", "5h"),
+            "mode": "percent",
+            "percent": rem_5h,
+            "center": f"{rem_5h}%",
+            "status": rem_status(rem_5h),
+            "tip1": T(f"Gemini{plan_tag}  5時間 残り {rem_f:.1f}%{rst_s}", f"Gemini{plan_tag}  5h: {rem_f:.1f}% left{rst_s}"),
+            "tip2": SEP.join(parts) + CLICK,
+        }
+    elif active_reset is not None:
         rst_s = T(f"（{fmt_jst(active_reset)} に戻る）", f" (resets {fmt_jst(active_reset)})")
         view_5h = {
             "key": "5h",
@@ -1152,7 +1442,7 @@ def collect_gemini(now, cfg, cache=None, force_plan=False):
             "tip2": T(f"消費 {fmt_tokens(t5)} トークン（{plan_hint}）", f"{fmt_tokens(t5)} tokens used ({plan_hint})") + CLICK,
         }
 
-    def make_view(key, sub, title, usd, cap, tok):
+    def make_est_view(key, sub, title, usd, cap, tok):
         used_pct = min(100.0, (usd / cap) * 100.0) if cap > 0 else 0.0
         rem = max(0, round(100.0 - used_pct))
         return {
@@ -1162,16 +1452,58 @@ def collect_gemini(now, cfg, cache=None, force_plan=False):
             "percent": rem,
             "center": f"{rem}%",
             "status": rem_status(rem),
-            "tip1": T(f"Gemini{plan_tag}  {title} 残り 約{rem}%（目安 ${usd:.2f} / ${cap:.0f}）", f"Gemini{plan_tag}  {title}: ~{rem}% left (est. ${usd:.2f} / ${cap:.0f})"),
+            "tip1": T(f"Gemini{est_tag}  {title} 残り 約{rem}%（目安 ${usd:.2f} / ${cap:.0f}）", f"Gemini{est_tag}  {title}: ~{rem}% left (est. ${usd:.2f} / ${cap:.0f})"),
             "tip2": T(f"消費 {fmt_tokens(tok)} トークン（{plan_hint}）", f"{fmt_tokens(tok)} tokens used ({plan_hint})") + CLICK,
         }
 
-    # 一番小さい時間軸（5時間 → 週間 → 月間）の順に並べる
-    views = [
-        view_5h,
-        make_view("week", T("週間", "Week"), T("週間", "Week"), u7, cap_w, t7),
-        make_view("month", T("月間", "Month"), T("月間", "Month"), u30, cap_m, t30),
-    ]
+    # 週間ビュー: 公式 `/usage` が取れたら実測値を最優先
+    if official and official.get("gemini_week_rem") is not None:
+        rem_f = max(0.0, min(100.0, float(official["gemini_week_rem"])))
+        used_f = max(0.0, 100.0 - rem_f)
+        rem_w = round(rem_f)
+        rst = official.get("gemini_week_resets_at")
+        rst_s = T(f"（{fmt_jst(rst)} に戻る）", f" (resets {fmt_jst(rst)})") if rst else ""
+        parts = [T(f"消費 {used_f:.1f}%", f"{used_f:.1f}% used"), T(f"7日 {fmt_tokens(t7)}", f"7d {fmt_tokens(t7)} tokens")]
+        if rec_note:
+            parts.append(rec_note)
+        view_week = {
+            "key": "week",
+            "sub": T("週間", "Week"),
+            "mode": "percent",
+            "percent": rem_w,
+            "center": f"{rem_w}%",
+            "status": rem_status(rem_w),
+            "tip1": T(f"Gemini{plan_tag}  週間 残り {rem_f:.1f}%{rst_s}", f"Gemini{plan_tag}  Week: {rem_f:.1f}% left{rst_s}"),
+            "tip2": SEP.join(parts) + CLICK,
+        }
+    else:
+        view_week = make_est_view("week", T("週間", "Week"), T("週間", "Week"), u7, cap_w, t7)
+
+    # 一番小さい時間軸（5時間 → 週間 → 契約内の別枠(Claude/GPT) → 月間目安）の順に並べる
+    views = [view_5h, view_week]
+    if official and official.get("cg_week_rem") is not None:
+        cg_w_f = max(0.0, min(100.0, float(official["cg_week_rem"])))
+        cg_w_rem = round(cg_w_f)
+        cg_rst = official.get("cg_week_resets_at")
+        cg_rst_s = T(f"（{fmt_jst(cg_rst)} に戻る）", f" (resets {fmt_jst(cg_rst)})") if cg_rst else ""
+        cg_parts = []
+        if official.get("cg_5h_rem") is not None:
+            cg_parts.append(T(f"5時間 残り {float(official['cg_5h_rem']):.1f}%", f"5h {float(official['cg_5h_rem']):.1f}% left"))
+        cg_parts.append(T("契約内の Claude・GPT 別枠", "Claude/GPT pool in same plan"))
+        if rec_note:
+            cg_parts.append(rec_note)
+        views.append({
+            "key": "cg_week",
+            "sub": T("別枠週", "Other Wk"),
+            "mode": "percent",
+            "percent": cg_w_rem,
+            "center": f"{cg_w_rem}%",
+            "status": rem_status(cg_w_rem),
+            "tip1": T(f"Gemini契約内 Claude・GPT  週間 残り {cg_w_f:.1f}%{cg_rst_s}", f"Gemini plan Claude/GPT  Week: {cg_w_f:.1f}% left{cg_rst_s}"),
+            "tip2": SEP.join(cg_parts) + CLICK,
+        })
+    views.append(make_est_view("month", T("月間", "Month"), T("月間", "Month"), u30, cap_m, t30))
+
     return {
         "id": "gemini",
         "label": "Gemini",
