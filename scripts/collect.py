@@ -966,19 +966,8 @@ def collect_claude(now, aos, cache, cfg=None, force_probe=False, official_overri
         f" ({plan_name} · official)" if (plan_name and is_cli_official) else ""
     )
 
-    # 実測ペースから週間上限USDを自動校正（5時間目安・月間目安の%算出に使う）
-    cl_hours = aos.get("claude_hours") or {}
-    default_week_cap = 2000.0 if (plan_name and "ultra" in plan_name.lower()) else (800.0 if (plan_name and "max" in plan_name.lower()) else 1500.0)
-    week_cap_usd = default_week_cap
-    if week_used is not None and week_used >= 5 and week_resets:
-        win_start_ts = week_resets - 7 * 86400
-        win_usd = sum(u for hk, (_, u) in cl_hours.items() if int(hk) >= win_start_ts - 3600)
-        if win_usd > 10.0:
-            week_cap_usd = max(100.0, win_usd / (week_used / 100.0))
-    cap_5h_usd = max(10.0, week_cap_usd / 14.0)
-    cap_m_usd = max(400.0, week_cap_usd * (30.0 / 7.0))
-
-    # 全AI共通の4スロット順: 1:5時間 -> 2:週間 -> 3:月間 -> 4:その他（別枠/24h）
+    # 全AI共通の3スロット順: 1:5時間 -> 2:週間 -> 3:その他（別枠・月間・残クレなど各AI固有）
+    # Claude には月間の縛りは無い。Ultra 等で公式5時間枠が無い場合は「週のみ（—）」とする。
     views = []
 
     # 1) 5時間スロット
@@ -997,19 +986,22 @@ def collect_claude(now, aos, cache, cfg=None, force_probe=False, official_overri
             "tip2": T(f"5時間消費 {fmt_tokens(tok_5h)}", f"5h used {fmt_tokens(tok_5h)} tokens") + usd_note(aos['claude_5h_usd']) + (SEP + rec_str if rec_str else "") + CLICK,
         })
     else:
-        used_5h_pct = min(100.0, (aos["claude_5h_usd"] / cap_5h_usd) * 100.0) if cap_5h_usd > 0 else 0.0
-        rem5 = 0 if limit_active else max(0, round(100.0 - used_5h_pct))
-        note5 = T("週間枠のみプラン・5時間ペース目安", "weekly-only plan · 5h pace est.") if (is_cli_official and week_used is not None) else T("5時間ペース目安", "5h pace est.")
+        rem_w_note = T(f"週間 残り {max(0, 100 - week_used)}%", f"week {max(0, 100 - week_used)}% left") if week_used is not None else ""
+        parts5 = [T(f"直近5時間 {fmt_tokens(tok_5h)}", f"last 5h {fmt_tokens(tok_5h)} tokens")]
+        if aos["claude_5h_usd"] > 0:
+            parts5.append(T(f"目安 ${aos['claude_5h_usd']:.1f}", f"~${aos['claude_5h_usd']:.1f}"))
+        if rem_w_note:
+            parts5.append(rem_w_note)
         views.append({
             "key": "5h",
             "slot": "5h",
-            "sub": T("5h目安", "5h est"),
+            "sub": T("週のみ", "Wk only"),
             "mode": "percent",
-            "percent": rem5,
-            "center": f"{rem5}%",
-            "status": "danger" if limit_active else rem_status(rem5),
-            "tip1": T(f"Claude  5時間目安 残り 約{rem5}%（消費 ${aos['claude_5h_usd']:.1f} / ${cap_5h_usd:.0f}）", f"Claude  5h est.: ~{rem5}% left (${aos['claude_5h_usd']:.1f} / ${cap_5h_usd:.0f})"),
-            "tip2": T(f"直近5時間 {fmt_tokens(tok_5h)}・{note5}", f"last 5h {fmt_tokens(tok_5h)} tokens · {note5}") + CLICK,
+            "percent": None,
+            "center": "—",
+            "status": "none",
+            "tip1": T(f"Claude{plan_tag}  5時間枠なし（週間枠のみのプラン）", f"Claude{plan_tag}  No 5h limit (weekly-only plan)"),
+            "tip2": SEP.join(parts5) + CLICK,
         })
 
     # 2) 週間スロット（公式）
@@ -1045,38 +1037,19 @@ def collect_claude(now, aos, cache, cfg=None, force_probe=False, official_overri
             "tip2": SEP.join(parts) + CLICK,
         })
     else:
-        u7 = aos.get("claude_7d_usd") or 0.0
-        t7 = aos.get("claude_7d_tok") or tok_24h
-        rem_w = max(0, round(100.0 - min(100.0, (u7 / week_cap_usd) * 100.0)))
         views.append({
             "key": "week",
             "slot": "week",
-            "sub": T("週目安", "Wk est"),
+            "sub": T("週間", "Week"),
             "mode": "percent",
-            "percent": rem_w,
-            "center": f"{rem_w}%",
-            "status": rem_status(rem_w),
-            "tip1": T(f"Claude  週間目安 残り 約{rem_w}%（消費 ${u7:.0f} / ${week_cap_usd:.0f}）", f"Claude  Week est.: ~{rem_w}% left (${u7:.0f} / ${week_cap_usd:.0f})"),
-            "tip2": T(f"7日 {fmt_tokens(t7)} トークン", f"7d {fmt_tokens(t7)} tokens") + CLICK,
+            "percent": None,
+            "center": "--",
+            "status": "none",
+            "tip1": T("Claude  週間枠 未取得", "Claude  Weekly limit unavailable"),
+            "tip2": T(f"24時間 {fmt_tokens(tok_24h)} トークン", f"24h {fmt_tokens(tok_24h)} tokens") + CLICK,
         })
 
-    # 3) 月間スロット（30日ペース目安%）
-    u30 = aos.get("claude_30d_usd") or 0.0
-    t30 = aos.get("claude_30d_tok") or tok_24h
-    rem_m = max(0, round(100.0 - min(100.0, (u30 / cap_m_usd) * 100.0))) if cap_m_usd > 0 else 100
-    views.append({
-        "key": "month",
-        "slot": "month",
-        "sub": T("月目安", "Mo est"),
-        "mode": "percent",
-        "percent": rem_m,
-        "center": f"{rem_m}%",
-        "status": rem_status(rem_m),
-        "tip1": T(f"Claude  月間目安 残り 約{rem_m}%（30日 ${u30:.0f} / ${cap_m_usd:.0f}）", f"Claude  Month est.: ~{rem_m}% left (30d ${u30:.0f} / ${cap_m_usd:.0f})"),
-        "tip2": T(f"30日消費 {fmt_tokens(t30)} トークン（週間ペース換算）", f"30d {fmt_tokens(t30)} tokens (from weekly pace)") + CLICK,
-    })
-
-    # 4) その他スロット（モデル別週間枠があれば優先、無ければ24時間目安%）
+    # 3) その他スロット（モデル別週間枠があれば優先、無ければ別枠なし）
     if extra_weeks:
         ew = extra_weeks[0]
         ename = str(ew.get("name") or "Extra").strip()
@@ -1095,18 +1068,16 @@ def collect_claude(now, aos, cache, cfg=None, force_probe=False, official_overri
             "tip2": T(f"24時間 {fmt_tokens(tok_24h)}", f"24h {fmt_tokens(tok_24h)} tokens") + (SEP + rec_str if rec_str else "") + CLICK,
         })
     else:
-        cap_24h = max(30.0, week_cap_usd / 5.0)
-        rem_24 = max(0, round(100.0 - min(100.0, (aos["claude_24h_usd"] / cap_24h) * 100.0)))
         views.append({
             "key": "extra",
             "slot": "extra",
-            "sub": T("24h目安", "24h est"),
+            "sub": T("別枠なし", "No extra"),
             "mode": "percent",
-            "percent": rem_24,
-            "center": f"{rem_24}%",
-            "status": rem_status(rem_24),
-            "tip1": T(f"Claude  24時間目安 残り 約{rem_24}%（消費 ${aos['claude_24h_usd']:.1f} / ${cap_24h:.0f}）", f"Claude  24h est.: ~{rem_24}% left (${aos['claude_24h_usd']:.1f} / ${cap_24h:.0f})"),
-            "tip2": T(f"24時間消費 {fmt_tokens(tok_24h)} トークン", f"24h {fmt_tokens(tok_24h)} tokens") + CLICK,
+            "percent": None,
+            "center": "—",
+            "status": "none",
+            "tip1": T("Claude  別枠・月間枠なし", "Claude  No extra or monthly limit"),
+            "tip2": T(f"24時間 {fmt_tokens(tok_24h)}", f"24h {fmt_tokens(tok_24h)} tokens") + usd_note(aos['claude_24h_usd']) + CLICK,
         })
 
     return {"id": "claude", "label": "Claude", "views": views}
@@ -1250,20 +1221,8 @@ def collect_codex(now, cache):
     bal_note = T(f"残クレジット {credits_bal:,.0f}", f"credits left {credits_bal:,.0f}") if has_balance else ""
     rec_note = T(f"記録 {fmt_jst(latest_ts)}", f"recorded {fmt_jst(latest_ts)}") if latest_ts else ""
 
-    # 実測ペースから週間トークン上限を自動校正
-    week_cap_tok = max(tok_7d * 2.0, 15_000_000_000.0)
-    if win_week:
-        _, wobj = win_week
-        u_w = float(wobj.get("used_percent") or 0.0)
-        rst_w = wobj.get("resets_at")
-        if u_w >= 3.0 and rst_w:
-            w_start = float(rst_w) - 7 * 86400
-            tok_win_w = sum(tk for mt, tk in file_toks if mt >= w_start)
-            if tok_win_w > 50_000_000:
-                week_cap_tok = max(500_000_000.0, tok_win_w / (u_w / 100.0))
-    cap_5h_tok = max(100_000_000.0, week_cap_tok / 14.0)
-    cap_m_tok = max(2_000_000_000.0, week_cap_tok * (30.0 / 7.0))
-
+    # 全AI共通の3スロット順: 1:5時間 -> 2:週間 -> 3:その他（追加クレジット残高など）
+    # Codex には月間の縛りは無い。Pro Lite 等で公式5時間枠が無い場合は「週のみ（—）」とする。
     views = []
 
     # 1) 5時間スロット
@@ -1290,17 +1249,23 @@ def collect_codex(now, cache):
             "tip2": SEP.join(parts) + CLICK,
         })
     else:
-        rem_5h = max(0, round(100.0 - min(100.0, (tok_5h / cap_5h_tok) * 100.0))) if cap_5h_tok > 0 else 100
+        w_note = ""
+        if win_week:
+            rem_w_tmp = max(0, 100 - round(max(0.0, min(100.0, float(win_week[1]["used_percent"])))))
+            w_note = T(f"週間 残り {rem_w_tmp}%", f"week {rem_w_tmp}% left")
+        parts5 = [T(f"直近5時間 {fmt_tokens(tok_5h)}", f"last 5h {fmt_tokens(tok_5h)} tokens")]
+        if w_note:
+            parts5.append(w_note)
         views.append({
             "key": "5h",
             "slot": "5h",
-            "sub": T("5h目安", "5h est"),
+            "sub": T("週のみ", "Wk only"),
             "mode": "percent",
-            "percent": rem_5h,
-            "center": f"{rem_5h}%",
-            "status": rem_status(rem_5h),
-            "tip1": T(f"Codex  5時間目安 残り 約{rem_5h}%（消費 {fmt_tokens(tok_5h)} / {fmt_tokens(cap_5h_tok)}）", f"Codex  5h est.: ~{rem_5h}% left ({fmt_tokens(tok_5h)} / {fmt_tokens(cap_5h_tok)})"),
-            "tip2": T(f"24時間 {fmt_tokens(tok_24h)}（週間枠のみプラン・5時間ペース目安）", f"24h {fmt_tokens(tok_24h)} (weekly-only plan · 5h pace est.)") + CLICK,
+            "percent": None,
+            "center": "—",
+            "status": "none",
+            "tip1": T("Codex  5時間枠なし（週間枠のみのプラン）", "Codex  No 5h limit (weekly-only plan)"),
+            "tip2": SEP.join(parts5) + CLICK,
         })
 
     # 2) 週間スロット（公式）
@@ -1329,34 +1294,19 @@ def collect_codex(now, cache):
             "tip2": SEP.join(parts) + CLICK,
         })
     else:
-        rem_w = max(0, round(100.0 - min(100.0, (tok_7d / week_cap_tok) * 100.0)))
         views.append({
             "key": "week",
             "slot": "week",
-            "sub": T("週目安", "Wk est"),
+            "sub": T("週間", "Week"),
             "mode": "percent",
-            "percent": rem_w,
-            "center": f"{rem_w}%",
-            "status": rem_status(rem_w),
-            "tip1": T(f"Codex  週間目安 残り 約{rem_w}%（7日 {fmt_tokens(tok_7d)}）", f"Codex  Week est.: ~{rem_w}% left (7d {fmt_tokens(tok_7d)})"),
+            "percent": None,
+            "center": "--",
+            "status": "none",
+            "tip1": T("Codex  週間枠 未取得", "Codex  Weekly limit unavailable"),
             "tip2": T(f"24時間 {fmt_tokens(tok_24h)} トークン", f"24h {fmt_tokens(tok_24h)} tokens") + CLICK,
         })
 
-    # 3) 月間スロット（30日ペース目安%）
-    rem_m = max(0, round(100.0 - min(100.0, (tok_30d / cap_m_tok) * 100.0))) if cap_m_tok > 0 else 100
-    views.append({
-        "key": "month",
-        "slot": "month",
-        "sub": T("月目安", "Mo est"),
-        "mode": "percent",
-        "percent": rem_m,
-        "center": f"{rem_m}%",
-        "status": rem_status(rem_m),
-        "tip1": T(f"Codex  月間目安 残り 約{rem_m}%（30日 {fmt_tokens(tok_30d)} / {fmt_tokens(cap_m_tok)}）", f"Codex  Month est.: ~{rem_m}% left (30d {fmt_tokens(tok_30d)} / {fmt_tokens(cap_m_tok)})"),
-        "tip2": T(f"7日 {fmt_tokens(tok_7d)}・30日 {fmt_tokens(tok_30d)} トークン（週間ペース換算）", f"7d {fmt_tokens(tok_7d)} · 30d {fmt_tokens(tok_30d)} tokens") + CLICK,
-    })
-
-    # 4) その他スロット（追加クレジット残高を最高残高比の残り%リングで表示）
+    # 3) その他スロット（追加クレジット残高を最高残高比の残り%リングで表示）
     if has_balance and credits_bal is not None:
         base_cr = max(peak_bal, credits_bal, 1.0)
         rem_cr = max(0, min(100, round((credits_bal / base_cr) * 100.0)))
@@ -1372,18 +1322,16 @@ def collect_codex(now, cache):
             "tip2": T("週間枠を使い切ってもこの残高から稼働（過去最大残高比）", "used after weekly limit (vs peak balance)") + CLICK,
         })
     else:
-        cap_24h = max(200_000_000.0, week_cap_tok / 5.0)
-        rem_24 = max(0, round(100.0 - min(100.0, (tok_24h / cap_24h) * 100.0)))
         views.append({
             "key": "extra",
             "slot": "extra",
-            "sub": T("24h目安", "24h est"),
+            "sub": T("残クレなし", "No credits"),
             "mode": "percent",
-            "percent": rem_24,
-            "center": f"{rem_24}%",
-            "status": rem_status(rem_24),
-            "tip1": T(f"Codex  24時間目安 残り 約{rem_24}%（消費 {fmt_tokens(tok_24h)}）", f"Codex  24h est.: ~{rem_24}% left ({fmt_tokens(tok_24h)})"),
-            "tip2": T("追加クレジットなし", "No extra credits") + CLICK,
+            "percent": None,
+            "center": "—",
+            "status": "none",
+            "tip1": T("Codex  追加クレジット・月間枠なし", "Codex  No extra credits or monthly limit"),
+            "tip2": T(f"24時間 {fmt_tokens(tok_24h)} トークン", f"24h {fmt_tokens(tok_24h)} tokens") + CLICK,
         })
 
     return {"id": "codex", "label": "Codex", "views": views}
@@ -2158,11 +2106,9 @@ def collect_gemini(now, cfg, cache=None, force_plan=False, official_override=_UN
     else:
         view_week = make_est_view("week", "week", T("週間", "Week"), T("週間", "Week"), u7, cap_w, t7)
 
-    # 月間ビュー（実測週間ペースから校正した月間残り%目安）
-    view_month = make_est_view("month", "month", T("月目安", "Mo est"), T("月間目安", "Month est."), u30, eff_cap_m, t30)
-
-    # 全AI共通の4スロット順: 1:5時間 -> 2:週間 -> 3:月間 -> 4:その他（契約内Claude/GPT別枠）
-    views = [view_5h, view_week, view_month]
+    # 全AI共通の3スロット順: 1:5時間 -> 2:週間 -> 3:その他（契約内Claude/GPT別枠）
+    # Gemini にも公式の月間枠は無いため、月間スロットは作らない。
+    views = [view_5h, view_week]
     if official and official.get("cg_week_rem") is not None:
         cg_w_f = max(0.0, min(100.0, float(official["cg_week_rem"])))
         cg_w_rem = round(cg_w_f)
@@ -2325,22 +2271,11 @@ def collect_opencode(now, aos, cfg, cache=None):
             "tip2": T(f"5h ${usd_5h:.2f}・週 ${usd_w:.2f}・月 ${usd_m:.2f}", f"5h ${usd_5h:.2f} · week ${usd_w:.2f} · month ${usd_m:.2f}") + CLICK,
         }
 
-    # 全AI共通の4スロット順: 1:5時間 -> 2:週間 -> 3:月間 -> 4:その他（別枠なし）
+    # 全AI共通の3スロット順: 1:5時間 -> 2:週間 -> 3:その他（OpenCode は月間枠）
     views = [
         make_view("5h", "5h", T("5時間", "5h"), T("5時間", "5h"), usd_5h, cap_5h, down_until is not None),
         make_view("week", "week", T("週間", "Week"), T("週間", "Week"), usd_w, cap_w, down_until is not None and "week" in (down_limit or "").lower()),
-        make_view("month", "month", T("月間", "Month"), T("月間", "Month"), usd_m, cap_m, down_until is not None and "month" in (down_limit or "").lower()),
-        {
-            "key": "extra",
-            "slot": "extra",
-            "sub": T("別枠なし", "No extra"),
-            "mode": "percent",
-            "percent": None,
-            "center": "—",
-            "status": "none",
-            "tip1": T("OpenCode Go  別枠・追加クレジットなし", "OpenCode Go  No extra pool or credits"),
-            "tip2": T(f"5h ${usd_5h:.2f}・週 ${usd_w:.2f}・月 ${usd_m:.2f}", f"5h ${usd_5h:.2f} · week ${usd_w:.2f} · month ${usd_m:.2f}") + CLICK,
-        },
+        make_view("month", "extra", T("月間", "Month"), T("月間", "Month"), usd_m, cap_m, down_until is not None and "month" in (down_limit or "").lower()),
     ]
     return {"id": "opencode", "label": "OpenCode", "views": views}
 

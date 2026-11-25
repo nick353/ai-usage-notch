@@ -77,8 +77,8 @@ local items = {
   placeholder("gemini", "Gemini"),
   placeholder("opencode", "OpenCode"),
 }
--- 各AIで共通の現在スロット（1:5時間 -> 2:週間 -> 3:月間 -> 4:その他。クリックで全AI一斉切替）
-local SLOT_ORDER = { "5h", "week", "month", "extra" }
+-- 各AIで共通の現在スロット（1:5時間 -> 2:週間 -> 3:その他［月間・別枠・残クレ］。クリックで全AI一斉切替）
+local SLOT_ORDER = { "5h", "week", "extra" }
 local globalSlot = "5h"
 local globalStep = 1
 local viewOverride = {} -- shift+クリックで個別切替したときだけ使う
