@@ -36,7 +36,7 @@ local COUNT = 4
 local GEAR_H = 20  -- 一番下の「•••」（表示するものを選ぶ）の段
 local function calcH(n) return 28 + STEP * (n - 1) + 42 + GEAR_H end
 local H = calcH(COUNT)
-local OPEN_W, REST_W = 54, 6
+local OPEN_W, REST_W = 58, 6
 local FILLET = 10
 local BLACK = { red = 0.04, green = 0.04, blue = 0.05, alpha = 1 }
 local GRAY = { white = 0.62 }
@@ -155,14 +155,14 @@ end
 local function ring(id, cx, cy, color, frac)
   local out = {
     -- 当たり判定はラベル付近まで少し広めにして押しやすくする
-    { id = id, type = "rectangle", frame = { x = cx - 24, y = cy - 16, w = 48, h = 52 }, action = "fill",
+    { id = id, type = "rectangle", frame = { x = cx - 26, y = cy - 17, w = 52, h = 54 }, action = "fill",
       fillColor = { white = 1, alpha = 0.001 }, trackMouseEnterExit = true, trackMouseDown = true },
-    { type = "circle", center = { x = cx, y = cy }, radius = 12.5, action = "stroke",
-      strokeColor = DIM, strokeWidth = 2.5 },
+    { type = "circle", center = { x = cx, y = cy }, radius = 14.2, action = "stroke",
+      strokeColor = DIM, strokeWidth = 2.4 },
   }
   if frac and frac > 0 then
-    table.insert(out, { type = "arc", center = { x = cx, y = cy }, radius = 12.5, startAngle = 0,
-      endAngle = 360 * math.min(frac, 1), action = "stroke", strokeColor = color, strokeWidth = 2.5,
+    table.insert(out, { type = "arc", center = { x = cx, y = cy }, radius = 14.2, startAngle = 0,
+      endAngle = 360 * math.min(frac, 1), action = "stroke", strokeColor = color, strokeWidth = 2.4,
       arcRadii = false })
   end
   return out
@@ -171,32 +171,33 @@ end
 local function nameLabel(text, cx, y)
   return { type = "text", text = hs.styledtext.new(text, { font = { size = 8.5 },
     color = NAME_COLOR, paragraphStyle = { alignment = "center" } }),
-    frame = { x = cx - 27, y = y, w = 54, h = 11 } }
+    frame = { x = cx - 29, y = y, w = 58, h = 11 } }
 end
 
 local function subLabel(text, cx, y, color)
   return { type = "text", text = hs.styledtext.new(text or "", { font = { size = 7.5 },
     color = color or SUB_DIM, paragraphStyle = { alignment = "center" } }),
-    frame = { x = cx - 27, y = y, w = 54, h = 10 } }
+    frame = { x = cx - 29, y = y, w = 58, h = 10 } }
 end
 
 local function centerText(text, cx, cy, color)
   local s = tostring(text or "--")
   local len = #s
-  local sz = len <= 3 and 9.5 or (len == 4 and 7.8 or 7.0)
-  local dy = len <= 3 and 6.2 or (len == 4 and 5.0 or 4.5)
+  local sz = len <= 3 and 9.0 or (len == 4 and 7.4 or 6.6)
+  local dy = len <= 3 and 5.8 or (len == 4 and 4.8 or 4.2)
   return { type = "text", text = hs.styledtext.new(s, { font = { name = ".AppleSystemUIFontBold", size = sz },
     color = color or WHITE, paragraphStyle = { alignment = "center" } }),
-    frame = { x = cx - 13, y = cy - dy, w = 26, h = 15 } }
+    frame = { x = cx - 14, y = cy - dy, w = 28, h = 15 } }
 end
 
 local function buttons(els, cx, top)
+  local initialLoading = loading and not rawItems
   for i, it in ipairs(items) do
     local v = activeView(it)
     local cy = top + 28 + (i - 1) * STEP
     local col = statusColor(v.status)
     local frac = 0
-    if loading then
+    if initialLoading then
       frac = ((pulse + (i - 1) * 0.7) % (2 * math.pi)) / (2 * math.pi)
       col = GRAY
     elseif v.mode == "percent" and type(v.percent) == "number" then
@@ -206,14 +207,19 @@ local function buttons(els, cx, top)
     end
     for _, e in ipairs(ring(it.id, cx, cy, col, frac)) do table.insert(els, e) end
     table.insert(els, centerText(v.center, cx, cy, WHITE))
-    table.insert(els, nameLabel(it.label, cx, cy + 16))
+    table.insert(els, nameLabel(it.label, cx, cy + 17))
     local subCol = v.mode == "percent" and SUB_DIM or { red = 0.52, green = 0.72, blue = 0.92 }
-    table.insert(els, subLabel(v.sub, cx, cy + 27, subCol))
+    table.insert(els, subLabel(v.sub, cx, cy + 28, subCol))
   end
   local gy = top + H - 14
   table.insert(els, { id = "gear", type = "rectangle", frame = { x = cx - 22, y = gy - 10, w = 44, h = 20 }, action = "fill",
     fillColor = { white = 1, alpha = 0.001 }, trackMouseEnterExit = true, trackMouseDown = true })
-  table.insert(els, { type = "text", text = hs.styledtext.new("•••", { font = { size = 9 }, color = SUB_DIM,
+  local gearCol = SUB_DIM
+  if loading and rawItems then
+    local a = 0.45 + 0.45 * math.sin(pulse * 1.4)
+    gearCol = { red = 0.48, green = 0.76, blue = 1.0, alpha = a }
+  end
+  table.insert(els, { type = "text", text = hs.styledtext.new("•••", { font = { size = 9 }, color = gearCol,
     paragraphStyle = { alignment = "center" } }), frame = { x = cx - 22, y = gy - 7, w = 44, h = 14 } })
 end
 
@@ -337,7 +343,7 @@ local fetchTask = nil
 local function refresh(force, refreshPlan)
   if fetchTask then return end
   local now = hs.timer.secondsSinceEpoch()
-  if not force and (now - lastFetch) < 15 then return end
+  if not force and (now - lastFetch) < 60 then return end
   loading = true
   if mode == "docked" and width > REST_W + 1 then draw() end
   local args = { COLLECT, "--lang", LANG }

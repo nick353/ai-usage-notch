@@ -5,6 +5,7 @@
 Claude Code のログイン情報で Anthropic の使用量の窓口に聞く（config.json の claude_oauth: false で止められる）。
 ログイン情報は Anthropic にだけ渡し、保存も表示もしない。"""
 
+from concurrent.futures import ThreadPoolExecutor
 import glob
 import json
 import os
@@ -163,96 +164,157 @@ def read_tail_lines(path, max_bytes):
         return []
 
 
-def collect_aos_usage(now):
-    """~/.config/aos/claude-usage.jsonl から Claude 5h/24h と OpenCode Go 5h/7d/30d を高速集計する。"""
+def collect_aos_usage(now, cache=None):
+    """~/.config/aos/claude-usage.jsonl から Claude 5h/24h と OpenCode Go 5h/7d/30d を増分キャッシュで高速集計する。"""
     p = os.path.join(HOME, ".config", "aos", "claude-usage.jsonl")
-    lines = read_tail_lines(p, max_bytes=32_000_000)
+    if not os.path.isfile(p):
+        return {
+            "claude_5h_tok": 0, "claude_5h_usd": 0.0,
+            "claude_24h_tok": 0, "claude_24h_usd": 0.0,
+            "go_5h": 0.0, "go_7d": 0.0, "go_30d": 0.0, "go_unknown_7d": 0,
+        }
+    try:
+        st = os.stat(p)
+    except Exception:
+        return {
+            "claude_5h_tok": 0, "claude_5h_usd": 0.0,
+            "claude_24h_tok": 0, "claude_24h_usd": 0.0,
+            "go_5h": 0.0, "go_7d": 0.0, "go_30d": 0.0, "go_unknown_7d": 0,
+        }
 
+    cutoff_30d = now - 30 * 86400
+    cutoff_7d = now - 7 * 86400
+    cutoff_24h = now - 86400
+    cutoff_5h = now - 5 * 3600
+
+    c = cache.get("aos_usage_v1") if isinstance(cache, dict) else None
+    if isinstance(c, dict) and c.get("ino") == st.st_ino and isinstance(c.get("offset"), int) and 0 <= c["offset"] <= st.st_size:
+        offset = c["offset"]
+        go_rows = [r for r in (c.get("go_rows") or []) if r[0] >= cutoff_30d]
+        go_unk_rows = [t for t in (c.get("go_unk_rows") or []) if t >= cutoff_7d]
+        cl_rows = [r for r in (c.get("cl_rows") or []) if r[0] >= cutoff_24h]
+        seen = set(c.get("seen_ids") or [])
+    else:
+        offset = 0
+        go_rows = []
+        go_unk_rows = []
+        cl_rows = []
+        seen = set()
+
+    go_keywords = ("go_allowance_usd", "grok-", "glm-", "kimi-", "qwen", "minimax", "deepseek")
     dt_now = datetime.fromtimestamp(now, tz=timezone.utc)
-    day_prefixes = {
+    recent_days = {
         dt_now.strftime("%Y-%m-%d"),
         (dt_now - timedelta(days=1)).strftime("%Y-%m-%d"),
+        (dt_now - timedelta(days=2)).strftime("%Y-%m-%d"),
     }
-    go_keywords = ("go_allowance_usd", "grok-", "glm-", "kimi-", "qwen", "minimax", "deepseek")
+
+    new_offset = offset
+    if st.st_size > offset:
+        try:
+            with open(p, "rb") as f:
+                f.seek(offset)
+                raw = f.read()
+            # 末尾の書き込み途中の不完全行は次回に回す
+            last_nl = raw.rfind(b"\n")
+            if last_nl >= 0:
+                chunk = raw[:last_nl + 1]
+                new_offset = offset + len(chunk)
+                for line in chunk.decode("utf-8", errors="ignore").splitlines():
+                    if not line:
+                        continue
+                    is_recent_day = any(dp in line[:260] for dp in recent_days)
+                    has_go = any(k in line for k in go_keywords)
+                    if not is_recent_day and not has_go:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(r, dict):
+                        continue
+                    rid = r.get("id")
+                    if rid:
+                        if rid in seen:
+                            continue
+                        seen.add(rid)
+                    at = parse_iso(r.get("at"))
+                    if at is None:
+                        continue
+                    age = now - at
+                    if age < 0 or age > 30 * 86400:
+                        continue
+
+                    go_a = r.get("go_allowance_usd")
+                    if go_a is not None:
+                        try:
+                            val = float(go_a)
+                            if val >= 0:
+                                go_rows.append([int(at), val])
+                        except Exception:
+                            pass
+                    elif has_go and at >= cutoff_7d:
+                        model = str(r.get("model") or "")
+                        if any(k in model for k in ("grok-", "glm-", "kimi-", "qwen", "minimax", "deepseek")):
+                            if r.get("ok") or r.get("tokens"):
+                                go_unk_rows.append(int(at))
+
+                    if at >= cutoff_24h:
+                        model = str(r.get("model") or "")
+                        actual = r.get("actualModels") or []
+                        is_claude = (
+                            "claude" in model.lower()
+                            or any("claude" in str(m).lower() for m in actual)
+                            or (r.get("estimated_usd") is not None and not model.startswith("gpt-"))
+                        )
+                        if is_claude:
+                            t = r.get("tokens")
+                            tok = 0
+                            if isinstance(t, dict):
+                                tok = (
+                                    int(t.get("input") or 0)
+                                    + int(t.get("cache_read") or 0)
+                                    + int(t.get("cache_write") or 0)
+                                    + int(t.get("output") or 0)
+                                )
+                            usd = r.get("estimated_usd")
+                            usd_val = float(usd) if isinstance(usd, (int, float)) and usd >= 0 else 0.0
+                            cl_rows.append([int(at), tok, usd_val])
+        except Exception:
+            pass
+
+    if isinstance(cache, dict):
+        seen_list = list(seen)[-4000:]
+        cache["aos_usage_v1"] = {
+            "ino": st.st_ino,
+            "offset": new_offset,
+            "go_rows": go_rows,
+            "go_unk_rows": go_unk_rows,
+            "cl_rows": cl_rows,
+            "seen_ids": seen_list,
+        }
 
     claude_5h_tok = 0
     claude_5h_usd = 0.0
     claude_24h_tok = 0
     claude_24h_usd = 0.0
-    go_5h = 0.0
-    go_7d = 0.0
-    go_30d = 0.0
-    go_unknown_7d = 0
-    seen = set()
+    for ts, tok, usd_val in cl_rows:
+        if ts >= cutoff_24h:
+            claude_24h_tok += tok
+            claude_24h_usd += usd_val
+            if ts >= cutoff_5h:
+                claude_5h_tok += tok
+                claude_5h_usd += usd_val
 
-    for line in lines:
-        if not line:
-            continue
-        is_recent_day = any(dp in line[:260] for dp in day_prefixes)
-        has_go = any(k in line for k in go_keywords)
-        if not is_recent_day and not has_go:
-            continue
-        try:
-            r = json.loads(line)
-        except Exception:
-            continue
-        if not isinstance(r, dict):
-            continue
-        rid = r.get("id")
-        if rid:
-            if rid in seen:
-                continue
-            seen.add(rid)
-        at = parse_iso(r.get("at"))
-        if at is None:
-            continue
-        age = now - at
-        if age < 0 or age > 30 * 86400:
-            continue
-
-        go_a = r.get("go_allowance_usd")
-        if go_a is not None:
-            try:
-                val = float(go_a)
-                if val >= 0:
-                    go_30d += val
-                    if age <= 7 * 86400:
-                        go_7d += val
-                    if age <= 5 * 3600:
-                        go_5h += val
-            except Exception:
-                pass
-        elif has_go and age <= 7 * 86400:
-            model = str(r.get("model") or "")
-            if any(k in model for k in ("grok-", "glm-", "kimi-", "qwen", "minimax", "deepseek")):
-                if r.get("ok") or r.get("tokens"):
-                    go_unknown_7d += 1
-
-        if age <= 86400:
-            model = str(r.get("model") or "")
-            actual = r.get("actualModels") or []
-            is_claude = (
-                "claude" in model.lower()
-                or any("claude" in str(m).lower() for m in actual)
-                or (r.get("estimated_usd") is not None and not model.startswith("gpt-"))
-            )
-            if is_claude:
-                t = r.get("tokens")
-                tok = 0
-                if isinstance(t, dict):
-                    tok = (
-                        int(t.get("input") or 0)
-                        + int(t.get("cache_read") or 0)
-                        + int(t.get("cache_write") or 0)
-                        + int(t.get("output") or 0)
-                    )
-                usd = r.get("estimated_usd")
-                usd_val = float(usd) if isinstance(usd, (int, float)) and usd >= 0 else 0.0
-                claude_24h_tok += tok
-                claude_24h_usd += usd_val
-                if age <= 5 * 3600:
-                    claude_5h_tok += tok
-                    claude_5h_usd += usd_val
+    go_5h = go_7d = go_30d = 0.0
+    for ts, val in go_rows:
+        if ts >= cutoff_30d:
+            go_30d += val
+            if ts >= cutoff_7d:
+                go_7d += val
+            if ts >= cutoff_5h:
+                go_5h += val
+    go_unknown_7d = sum(1 for ts in go_unk_rows if ts >= cutoff_7d)
 
     return {
         "claude_5h_tok": claude_5h_tok,
@@ -417,7 +479,369 @@ def collect_claude_oauth(now, cache, cfg):
     return data
 
 
-def collect_claude(now, aos, cache, cfg=None):
+def _render_vt100(raw_text, rows=45, cols=120):
+    """PTY 出力のカーソル制御を簡易エミュレートし、最終画面のテキスト行リストを返す。"""
+    grid = [[" "] * cols for _ in range(rows)]
+    r_cur = 0
+    c_cur = 0
+    i = 0
+    n = len(raw_text)
+    while i < n:
+        ch = raw_text[i]
+        if ch == "\x1b" and i + 1 < n and raw_text[i + 1] == "[":
+            j = i + 2
+            while j < n and raw_text[j] in "0123456789;?":
+                j += 1
+            cmd = raw_text[j] if j < n else ""
+            params = raw_text[i + 2:j].lstrip("?")
+            nums = [int(x) for x in params.split(";") if x.isdigit()]
+            if cmd in ("H", "f"):
+                r_cur = max(0, min(rows - 1, (nums[0] if len(nums) >= 1 else 1) - 1))
+                c_cur = max(0, min(cols - 1, (nums[1] if len(nums) >= 2 else 1) - 1))
+            elif cmd == "A":
+                r_cur = max(0, r_cur - (nums[0] if nums else 1))
+            elif cmd == "B":
+                r_cur = min(rows - 1, r_cur + (nums[0] if nums else 1))
+            elif cmd == "C":
+                c_cur = min(cols - 1, c_cur + (nums[0] if nums else 1))
+            elif cmd == "D":
+                c_cur = max(0, c_cur - (nums[0] if nums else 1))
+            elif cmd == "G":
+                c_cur = max(0, min(cols - 1, (nums[0] if nums else 1) - 1))
+            elif cmd == "J":
+                mode = nums[0] if nums else 0
+                if mode == 2:
+                    grid = [[" "] * cols for _ in range(rows)]
+                elif mode == 0:
+                    for cc in range(c_cur, cols):
+                        grid[r_cur][cc] = " "
+                    for rr in range(r_cur + 1, rows):
+                        grid[rr] = [" "] * cols
+            elif cmd == "K":
+                mode = nums[0] if nums else 0
+                if mode == 0:
+                    for cc in range(c_cur, cols):
+                        grid[r_cur][cc] = " "
+                elif mode == 2:
+                    grid[r_cur] = [" "] * cols
+            i = j + 1
+        elif ch == "\x1b" and i + 1 < n and raw_text[i + 1] == "]":
+            bel = raw_text.find("\x07", i + 2)
+            i = bel + 1 if bel >= 0 else i + 2
+        elif ch == "\x1b":
+            i += 2
+        elif ch == "\r":
+            c_cur = 0
+            i += 1
+        elif ch == "\n":
+            r_cur = min(rows - 1, r_cur + 1)
+            i += 1
+        elif ord(ch) >= 32:
+            if 0 <= r_cur < rows and 0 <= c_cur < cols:
+                grid[r_cur][c_cur] = ch
+                c_cur += 1
+            i += 1
+        else:
+            i += 1
+    return ["".join(row).rstrip() for row in grid]
+
+
+def _find_claude_bin():
+    for cand in (
+        os.environ.get("AOS_CLAUDE_BIN"),
+        os.path.join(HOME, ".local", "bin", "claude"),
+        "/usr/local/bin/claude",
+        "/opt/homebrew/bin/claude",
+        shutil.which("claude"),
+    ):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _find_claude_trusted_cwd():
+    """Claude Code が既に信頼済みのフォルダを1つ選ぶ（macOS の TCC 対象フォルダは避ける）。"""
+    tcc_avoid = tuple(os.path.join(HOME, d) for d in ("Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music"))
+    cj = os.path.join(HOME, ".claude.json")
+    candidates = []
+    try:
+        with open(cj, encoding="utf-8") as f:
+            d = json.load(f)
+        projs = d.get("projects")
+        if isinstance(projs, dict):
+            for p, info in projs.items():
+                if not isinstance(info, dict) or not info.get("hasTrustDialogAccepted") or not os.path.isdir(p):
+                    continue
+                if any(p == t or p.startswith(t + os.sep) for t in tcc_avoid):
+                    continue
+                candidates.append(p)
+    except Exception:
+        pass
+    if BASE in candidates:
+        return BASE
+    for p in candidates:
+        if p.startswith(os.path.join(HOME, "Projects") + os.sep):
+            return p
+    if candidates:
+        return candidates[0]
+    return BASE
+
+
+_MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _parse_claude_reset_str(s, now):
+    """'Resets Nov 29 at 10:59pm (Asia/Tokyo)' や 'Resets 7pm' / 'Resets in 2h 15m' をタイムスタンプに変換する。"""
+    if not s:
+        return None
+    m_in = re.search(r"Resets\s+in\s+([0-9dhms ]+)", s, re.I)
+    if m_in:
+        dur = _parse_duration_sec(m_in.group(1).strip())
+        if dur:
+            return now + dur
+    now_dt = datetime.fromtimestamp(now)
+    # 例: Resets Nov 29 at 10:59pm / Resets Nov 29, 11pm
+    m_dt = re.search(
+        r"Resets\s+([A-Za-z]{3})\s+(\d{1,2})(?:\s+at|\s*,)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)",
+        s,
+        re.I,
+    )
+    if m_dt:
+        mon = _MONTH_MAP.get(m_dt.group(1).lower())
+        if mon:
+            day = int(m_dt.group(2))
+            hh = int(m_dt.group(3)) % 12
+            if m_dt.group(5).lower() == "pm":
+                hh += 12
+            mm = int(m_dt.group(4) or 0)
+            for yr in (now_dt.year, now_dt.year + 1):
+                try:
+                    cand = datetime(yr, mon, day, hh, mm).timestamp()
+                    if cand >= now - 3600:
+                        return cand
+                except Exception:
+                    continue
+    # 例: Resets 7:30pm / Resets 11pm
+    m_tm = re.search(r"Resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)", s, re.I)
+    if m_tm:
+        hh = int(m_tm.group(1)) % 12
+        if m_tm.group(3).lower() == "pm":
+            hh += 12
+        mm = int(m_tm.group(2) or 0)
+        cand = datetime(now_dt.year, now_dt.month, now_dt.day, hh, mm).timestamp()
+        if cand < now - 60:
+            cand += 86400
+        return cand
+    return None
+
+
+def _parse_claude_usage_output(raw_text, now):
+    """Claude Code CLI (`claude`) の `/usage` 画面から公式の使用率とリセット時刻を抜く。"""
+    if not raw_text:
+        return None
+    lines = [l.strip() for l in _render_vt100(raw_text, rows=45, cols=120) if l.strip()]
+    plan_name = None
+    for l in lines[:8]:
+        m_pl = re.search(r"·\s*(Claude\s+[A-Za-z0-9 +_-]+)", l)
+        if m_pl:
+            plan_name = m_pl.group(1).strip()
+            break
+
+    five_used = None
+    five_resets = None
+    week_used = None
+    week_resets = None
+    extra_weeks = []
+
+    i = 0
+    while i < len(lines):
+        l = lines[i]
+        ll = l.lower()
+        if ll.startswith("current session") or ll.startswith("current week"):
+            # 直後数行から % used と Resets を拾う
+            pct = None
+            rst = None
+            for j in range(i, min(len(lines), i + 4)):
+                if pct is None:
+                    mp = re.search(r"(\d+(?:\.\d+)?)\s*%\s*used", lines[j], re.I)
+                    if mp:
+                        pct = max(0.0, min(100.0, float(mp.group(1))))
+                if rst is None and "resets" in lines[j].lower():
+                    rst = _parse_claude_reset_str(lines[j], now)
+            if pct is not None:
+                if ll.startswith("current session"):
+                    five_used = pct
+                    five_resets = rst
+                elif "all models" in ll or l.strip().lower() == "current week":
+                    week_used = pct
+                    week_resets = rst
+                else:
+                    m_lbl = re.search(r"\(([^()]+)\)", l)
+                    if m_lbl:
+                        extra_weeks.append({
+                            "name": m_lbl.group(1).strip(),
+                            "used": pct,
+                            "resets": rst,
+                        })
+        i += 1
+
+    if five_used is None and week_used is None:
+        return None
+    return {
+        "at": now,
+        "plan_name": plan_name,
+        "five_used": five_used,
+        "five_resets": five_resets,
+        "week_used": week_used,
+        "week_resets": week_resets,
+        "extra_weeks": extra_weeks,
+    }
+
+
+def _probe_claude_usage(now, cache, cfg, force=False):
+    """公式 CLI (`claude`) の `/usage` 画面を PTY で読み、公式の使用率を取得する（既定5分キャッシュ）。"""
+    if cfg.get("claude_cli_usage") is False or pty is None:
+        return None
+
+    c = cache.get("claude_official_usage_v1") or {}
+    cached_data = c.get("data") if isinstance(c.get("data"), dict) else None
+    interval = max(60, int(cfg.get("claude_usage_interval_sec") or 300))
+
+    if not force and cached_data and c.get("at"):
+        rst_passed = False
+        for rk in ("five_resets", "week_resets"):
+            rv = cached_data.get(rk)
+            if isinstance(rv, (int, float)) and rv > 0 and now >= rv:
+                rst_passed = True
+                break
+        if not rst_passed and (now - float(c["at"])) < interval:
+            return cached_data
+
+    if not force and c.get("retry_after") and now < float(c["retry_after"]):
+        if cached_data and c.get("at") and (now - float(c["at"])) < 3600:
+            return cached_data
+        return None
+
+    cl = _find_claude_bin()
+    if not cl:
+        cache["claude_official_usage_v1"] = {**c, "retry_after": now + 600}
+        return cached_data if (cached_data and c.get("at") and (now - float(c["at"])) < 3600) else None
+
+    master = None
+    proc = None
+    buf = b""
+    try:
+        master, slave = pty.openpty()
+        env = os.environ.copy()
+        env.pop("ANTHROPIC_API_KEY", None)
+        user_name = env.get("USER") or os.path.basename(HOME)
+        env["USER"] = user_name
+        env.setdefault("LOGNAME", user_name)
+        extra_path = os.path.join(HOME, ".local", "bin") + ":/opt/homebrew/bin:/usr/local/bin"
+        env["PATH"] = extra_path + ":" + env.get("PATH", "/usr/bin:/bin")
+        env["TERM"] = "xterm-256color"
+        env["COLUMNS"] = "120"
+        env["LINES"] = "45"
+        proc = subprocess.Popen(
+            [cl],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env=env,
+            cwd=_find_claude_trusted_cwd(),
+            close_fds=True,
+            start_new_session=True,
+        )
+        os.close(slave)
+
+        t0 = time.time()
+        deadline = t0 + 14.0
+        sent = 0
+        t_sent = 0.0
+        while time.time() < deadline:
+            r, _, _ = select.select([master], [], [], 0.1)
+            if r:
+                try:
+                    chunk = os.read(master, 65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                except OSError:
+                    break
+            txt = _ANSI_ESCAPE_RE.sub(" ", buf.decode("utf-8", errors="ignore"))
+            if "Do you trust the files" in txt or "Do you trust the contents" in txt:
+                break
+            if "API Usage Billing" in txt and (time.time() - t0) > 1.5:
+                break
+            if sent == 0:
+                if "Make auto mode" in txt:
+                    os.write(master, b"\x1b")
+                    time.sleep(0.25)
+                    os.write(master, b"/usage\r")
+                    sent = 1
+                    t_sent = time.time()
+                elif ("Try " in txt or "shortcuts" in txt or "bypass permissions" in txt) and (time.time() - t0) > 1.8:
+                    os.write(master, b"/usage\r")
+                    sent = 1
+                    t_sent = time.time()
+            else:
+                if ("Current week" in txt or "Current session" in txt) and "% used" in txt and (
+                    "Usage credits" in txt or "Extra usage" in txt or (time.time() - t_sent) > 2.5
+                ):
+                    end2 = time.time() + 0.45
+                    while time.time() < end2:
+                        r2, _, _ = select.select([master], [], [], 0.05)
+                        if r2:
+                            try:
+                                c2 = os.read(master, 65536)
+                                if not c2:
+                                    break
+                                buf += c2
+                            except OSError:
+                                break
+                    break
+                if sent == 1 and (time.time() - t_sent) > 2.0 and "Usage" not in txt:
+                    os.write(master, b"\r")
+                    sent = 2
+    except Exception:
+        pass
+    finally:
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=0.8)
+            except Exception:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        if master is not None:
+            try:
+                os.close(master)
+            except Exception:
+                pass
+
+    parsed = _parse_claude_usage_output(buf.decode("utf-8", errors="ignore"), now)
+    if parsed:
+        cache["claude_official_usage_v1"] = {"at": now, "data": parsed}
+        return parsed
+
+    cache["claude_official_usage_v1"] = {**c, "retry_after": now + 300}
+    if cached_data and c.get("at") and (now - float(c["at"])) < 3600:
+        return cached_data
+    return None
+
+
+_UNSET = object()
+
+
+def collect_claude(now, aos, cache, cfg=None, force_probe=False, official_override=_UNSET):
     week_path = os.path.join(HOME, ".config", "aos", "claude-week.json")
     limit_path = os.path.join(HOME, ".config", "aos", "claude-limit.json")
     hist_path = os.path.join(HOME, ".config", "aos", "claude-week-history.jsonl")
@@ -440,27 +864,54 @@ def collect_claude(now, aos, cache, cfg=None):
     # 5時間枠の公式記録があれば拾う
     five_used = None
     five_resets = None
+    extra_weeks = []
+    plan_name = None
+    is_cli_official = False
+
+    # claude-week.json が無い・5分以上古い・強制更新時は claude CLI の公式 /usage から最新実測を取る
+    need_cli = force_probe or week_used is None or not updated_at or (now - updated_at) > 300
+    cli_official = None if official_override is _UNSET else official_override
+    if official_override is _UNSET and need_cli:
+        cli_official = _probe_claude_usage(now, cache, cfg or {}, force=force_probe)
+
+    if isinstance(cli_official, dict):
+        cli_at = cli_official.get("at") or now
+        if updated_at is None or cli_at >= updated_at or force_probe:
+            if cli_official.get("week_used") is not None:
+                week_used = round(float(cli_official["week_used"]))
+                if cli_official.get("week_resets"):
+                    week_resets = cli_official["week_resets"]
+                updated_at = cli_at
+                is_cli_official = True
+            if cli_official.get("five_used") is not None:
+                five_used = round(float(cli_official["five_used"]))
+                five_resets = cli_official.get("five_resets")
+                is_cli_official = True
+            extra_weeks = cli_official.get("extra_weeks") or []
+            plan_name = cli_official.get("plan_name")
+
     oauth = None
-    if week_used is None or not updated_at or now - updated_at > 6 * 3600:
+    if not is_cli_official and (week_used is None or not updated_at or now - updated_at > 6 * 3600):
         oauth = collect_claude_oauth(now, cache, cfg or {})
     if oauth and oauth.get("week"):
         week_used = round(oauth["week"]["used"])
         week_resets = oauth["week"]["resets"]
         updated_at = now
-    for hl in reversed(read_tail_lines(hist_path, max_bytes=32_000)):
-        if "fiveLast" not in hl:
-            continue
-        try:
-            hd = json.loads(hl)
-            fl = hd.get("fiveLast")
-            if isinstance(fl, (int, float)):
-                fr = parse_iso(hd.get("fiveLastResetsAt"))
-                if not fr or fr > now:
-                    five_used = round(max(0.0, min(1.0, float(fl))) * 100)
-                    five_resets = fr
-                break
-        except Exception:
-            pass
+    if five_used is None:
+        for hl in reversed(read_tail_lines(hist_path, max_bytes=32_000)):
+            if "fiveLast" not in hl:
+                continue
+            try:
+                hd = json.loads(hl)
+                fl = hd.get("fiveLast")
+                if isinstance(fl, (int, float)):
+                    fr = parse_iso(hd.get("fiveLastResetsAt"))
+                    if not fr or fr > now:
+                        five_used = round(max(0.0, min(1.0, float(fl))) * 100)
+                        five_resets = fr
+                    break
+            except Exception:
+                pass
 
     if oauth and oauth.get("five"):
         five_used = round(oauth["five"]["used"])
@@ -486,6 +937,9 @@ def collect_claude(now, aos, cache, cfg=None):
     tok_5h = max(aos["claude_5h_tok"], chat_5h)
     tok_24h = max(aos["claude_24h_tok"], chat_24h)
     rec_str = T(f"記録 {fmt_jst(updated_at)}", f"recorded {fmt_jst(updated_at)}") if updated_at else ""
+    plan_tag = f" ({plan_name}・公式)" if (plan_name and is_cli_official and LANG == "ja") else (
+        f" ({plan_name} · official)" if (plan_name and is_cli_official) else ""
+    )
 
     views = []
 
@@ -500,8 +954,8 @@ def collect_claude(now, aos, cache, cfg=None):
             "percent": rem5,
             "center": f"{rem5}%",
             "status": rem_status(rem5),
-            "tip1": T(f"Claude  5時間 残り {rem5}%{rst5}", f"Claude  5h: {rem5}% left{rst5}"),
-            "tip2": T(f"5時間消費 {fmt_tokens(tok_5h)}", f"5h used {fmt_tokens(tok_5h)} tokens") + usd_note(aos['claude_5h_usd']) + CLICK,
+            "tip1": T(f"Claude{plan_tag}  5時間 残り {rem5}%{rst5}", f"Claude{plan_tag}  5h: {rem5}% left{rst5}"),
+            "tip2": T(f"5時間消費 {fmt_tokens(tok_5h)}", f"5h used {fmt_tokens(tok_5h)} tokens") + usd_note(aos['claude_5h_usd']) + (SEP + rec_str if rec_str else "") + CLICK,
         })
 
     # 2) 週間枠（公式）
@@ -513,7 +967,7 @@ def collect_claude(now, aos, cache, cfg=None):
             "percent": 0,
             "center": "0%",
             "status": "danger",
-            "tip1": f"Claude  {limit_active}",
+            "tip1": f"Claude{plan_tag}  {limit_active}",
             "tip2": T(f"24時間 {fmt_tokens(tok_24h)}", f"24h {fmt_tokens(tok_24h)} tokens") + usd_note(aos['claude_24h_usd']) + CLICK,
         })
     elif week_used is not None:
@@ -531,12 +985,32 @@ def collect_claude(now, aos, cache, cfg=None):
             "percent": rem_w,
             "center": f"{rem_w}%",
             "status": rem_status(rem_w),
-            "tip1": T(f"Claude  週間 残り {rem_w}%{rst_w}", f"Claude  Week: {rem_w}% left{rst_w}"),
+            "tip1": T(f"Claude{plan_tag}  週間 残り {rem_w}%{rst_w}", f"Claude{plan_tag}  Week: {rem_w}% left{rst_w}"),
             "tip2": SEP.join(parts) + CLICK,
+        })
+
+    # 2b) モデル別週間枠（例: Fable など）が公式にあれば切替ビューに足す
+    for ew in extra_weeks:
+        ename = str(ew.get("name") or "").strip()
+        if not ename:
+            continue
+        ew_rem = max(0, 100 - round(float(ew.get("used") or 0)))
+        ew_rst = ew.get("resets")
+        ew_rst_s = T(f"（{fmt_jst(ew_rst)} に戻る）", f" (resets {fmt_jst(ew_rst)})") if ew_rst else ""
+        views.append({
+            "key": "week_" + re.sub(r"[^a-z0-9]+", "_", ename.lower()).strip("_"),
+            "sub": ename[:6],
+            "mode": "percent",
+            "percent": ew_rem,
+            "center": f"{ew_rem}%",
+            "status": rem_status(ew_rem),
+            "tip1": T(f"Claude ({ename})  週間 残り {ew_rem}%{ew_rst_s}", f"Claude ({ename})  Week: {ew_rem}% left{ew_rst_s}"),
+            "tip2": (rec_str + CLICK) if rec_str else T("モデル別の週間枠", "Model-specific weekly limit") + CLICK,
         })
 
     # 3) 公式5時間%が無い場合は、5時間消費量を切替ビューに置く
     if five_used is None:
+        note5 = T("このプランは週間枠のみ", "weekly limit only on this plan") if (is_cli_official and week_used is not None) else T("公式の5時間%は未取得", "official 5h % not available")
         views.append({
             "key": "5h_tok",
             "sub": T("5h消費", "5h used"),
@@ -545,7 +1019,7 @@ def collect_claude(now, aos, cache, cfg=None):
             "center": fmt_tokens(tok_5h),
             "status": "info" if tok_5h > 0 else "none",
             "tip1": T(f"Claude  直近5時間の消費 {fmt_tokens(tok_5h)} トークン", f"Claude  last 5h: {fmt_tokens(tok_5h)} tokens"),
-            "tip2": T("公式の5時間%は未取得", "official 5h % not available") + usd_note(aos['claude_5h_usd']) + CLICK,
+            "tip2": note5 + usd_note(aos['claude_5h_usd']) + CLICK,
         })
 
     # 4) 24時間消費量
@@ -721,7 +1195,7 @@ def collect_codex(now, cache):
             "mode": "tokens",
             "percent": None,
             "center": fmt_short_num(credits_bal),
-            "status": "ok",
+            "status": "info",
             "tip1": T(f"Codex  追加クレジット 残り {credits_bal:,.0f}", f"Codex  extra credits left {credits_bal:,.0f}"),
             "tip2": T("週間枠を使い切ってもこの残高から稼働", "used after the weekly limit runs out") + CLICK,
         })
@@ -1249,7 +1723,7 @@ def _resolve_gemini_plan(now, cfg, cache, u5, active_reset, force_plan=False):
     return plan_key, plan_mode, spec["label"], cap_5h, cap_w, cap_m
 
 
-def collect_gemini(now, cfg, cache=None, force_plan=False):
+def collect_gemini(now, cfg, cache=None, force_plan=False, official_override=_UNSET):
     if cache is None:
         cache = {}
 
@@ -1325,7 +1799,13 @@ def collect_gemini(now, cfg, cache=None, force_plan=False):
     win_start = win["win_start"]
     win_end = win["win_end"]
 
-    official = _probe_gemini_usage(now, cache, cfg, force=force_plan)
+    official = _probe_gemini_usage(now, cache, cfg, force=force_plan) if official_override is _UNSET else official_override
+    if official and official.get("gemini_5h_resets_at"):
+        # 公式の5時間リセット時刻が分かっているときは、その5時間前から現在までの実トークンを集計する
+        off_5h_start = float(official["gemini_5h_resets_at"]) - 5 * 3600
+        win_start = off_5h_start
+        t5 = sum(tok for ts, _, tok in events if ts >= off_5h_start)
+        u5 = sum(usd for ts, usd, _ in events if ts >= off_5h_start)
     if official and official.get("plan_name"):
         pname = official["plan_name"]
         pl = pname.lower()
@@ -1502,7 +1982,19 @@ def collect_gemini(now, cfg, cache=None, force_plan=False):
             "tip1": T(f"Gemini契約内 Claude・GPT  週間 残り {cg_w_f:.1f}%{cg_rst_s}", f"Gemini plan Claude/GPT  Week: {cg_w_f:.1f}% left{cg_rst_s}"),
             "tip2": SEP.join(cg_parts) + CLICK,
         })
-    views.append(make_est_view("month", T("月間", "Month"), T("月間", "Month"), u30, cap_m, t30))
+    if official:
+        views.append({
+            "key": "month",
+            "sub": T("30日消費", "30d used"),
+            "mode": "tokens",
+            "percent": None,
+            "center": fmt_tokens(t30),
+            "status": "info" if t30 > 0 else "none",
+            "tip1": T(f"Gemini ({plan_label})  30日間の消費 {fmt_tokens(t30)} トークン", f"Gemini ({plan_label})  30d used: {fmt_tokens(t30)} tokens"),
+            "tip2": T(f"目安 ${u30:.1f}（Gemini に公式の月間枠はなし）", f"est. ${u30:.1f} (no official monthly cap)") + CLICK,
+        })
+    else:
+        views.append(make_est_view("month", T("月間", "Month"), T("月間", "Month"), u30, cap_m, t30))
 
     return {
         "id": "gemini",
@@ -1513,43 +2005,79 @@ def collect_gemini(now, cfg, cache=None, force_plan=False):
         "views": views,
     }
 
-def collect_opencode_db(now):
+def collect_opencode_db(now, cache=None):
     dbp = os.path.join(HOME, ".local", "share", "opencode", "opencode.db")
     if not os.path.isfile(dbp):
         return 0.0, 0.0, 0.0
     try:
+        st = os.stat(dbp)
+        wal = dbp + "-wal"
+        wal_sig = ""
+        if os.path.isfile(wal):
+            wst = os.stat(wal)
+            wal_sig = f":{int(wst.st_mtime)}:{wst.st_size}"
+        sig = f"{int(st.st_mtime)}:{st.st_size}{wal_sig}"
         c5_ms = int((now - 5 * 3600) * 1000)
         c7_ms = int((now - 7 * 86400) * 1000)
         c30_ms = int((now - 30 * 86400) * 1000)
-        con = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
-        cur = con.cursor()
-        rows = cur.execute(
-            "SELECT time_created, data FROM message WHERE time_created >= ?",
-            (c30_ms,),
-        ).fetchall()
-        con.close()
-        u5 = u7 = u30 = 0.0
-        for tc, raw in rows:
-            if not raw:
-                continue
+
+        ent = cache.get("opencode_db_v1") if isinstance(cache, dict) else None
+        if isinstance(ent, dict) and ent.get("sig") == sig:
+            rows_parsed = ent.get("rows") or []
+        else:
+            con = None
             try:
-                d = json.loads(raw)
-                c = d.get("cost")
-                if isinstance(c, (int, float)) and c > 0:
-                    val = float(c)
-                    u30 += val
-                    if tc >= c7_ms:
-                        u7 += val
-                    if tc >= c5_ms:
-                        u5 += val
+                con = sqlite3.connect(dbp, timeout=2.0)
+                con.execute("PRAGMA query_only = ON")
+                rows = con.execute(
+                    "SELECT time_created, data FROM message WHERE time_created >= ?",
+                    (c30_ms,),
+                ).fetchall()
             except Exception:
-                pass
+                if con is not None:
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
+                con = sqlite3.connect(f"file:{dbp}?mode=ro&immutable=1", uri=True)
+                rows = con.execute(
+                    "SELECT time_created, data FROM message WHERE time_created >= ?",
+                    (c30_ms,),
+                ).fetchall()
+            finally:
+                if con is not None:
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
+            rows_parsed = []
+            for tc, raw in rows:
+                if not raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                    c = d.get("cost")
+                    if isinstance(c, (int, float)) and c > 0:
+                        rows_parsed.append([int(tc), float(c)])
+                except Exception:
+                    pass
+            if isinstance(cache, dict):
+                cache["opencode_db_v1"] = {"sig": sig, "rows": rows_parsed}
+
+        u5 = u7 = u30 = 0.0
+        for tc, val in rows_parsed:
+            if tc >= c30_ms:
+                u30 += val
+                if tc >= c7_ms:
+                    u7 += val
+                if tc >= c5_ms:
+                    u5 += val
         return u5, u7, u30
     except Exception:
         return 0.0, 0.0, 0.0
 
 
-def collect_opencode(now, aos, cfg):
+def collect_opencode(now, aos, cfg, cache=None):
     cap_5h = float(cfg.get("opencode_5h_usd") or 7.0)
     cap_w = float(cfg.get("opencode_week_usd") or 17.5)
     cap_m = float(cfg.get("opencode_month_usd") or 35.0)
@@ -1568,7 +2096,7 @@ def collect_opencode(now, aos, cfg):
         except Exception:
             pass
 
-    db5, db7, db30 = collect_opencode_db(now)
+    db5, db7, db30 = collect_opencode_db(now, cache)
     usd_5h = aos["go_5h"] + db5
     usd_w = aos["go_7d"] + db7
     usd_m = aos["go_30d"] + db30
@@ -1671,12 +2199,49 @@ def main():
     now = time.time()
     cfg = load_config()
     cache = load_cache()
-    aos = collect_aos_usage(now)
+    force_refresh = "--refresh-plan" in sys.argv
+    aos = collect_aos_usage(now, cache)
+
+    # Claude / Gemini の公式 /usage 取得はキャッシュ切れ時に数秒かかるため並列実行する
+    week_path = os.path.join(HOME, ".config", "aos", "claude-week.json")
+    claude_week_fresh = False
+    if not force_refresh and os.path.isfile(week_path):
+        try:
+            with open(week_path, encoding="utf-8") as f:
+                w = json.load(f)
+            uat = parse_iso(w.get("at"))
+            if uat and (now - uat) <= 300:
+                claude_week_fresh = True
+        except Exception:
+            pass
+
+    claude_cache_sub = {"claude_official_usage_v1": cache.get("claude_official_usage_v1")}
+    gemini_cache_sub = {"gemini_official_usage_v1": cache.get("gemini_official_usage_v1")}
+    cached_cl_ent = cache.get("claude_official_usage_v1") or {}
+    claude_off = cached_cl_ent.get("data") if isinstance(cached_cl_ent.get("data"), dict) else None
+    gemini_off = None
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_c = None if claude_week_fresh else ex.submit(_probe_claude_usage, now, claude_cache_sub, cfg, force_refresh)
+        fut_g = ex.submit(_probe_gemini_usage, now, gemini_cache_sub, cfg, force_refresh)
+        if fut_c is not None:
+            try:
+                claude_off = fut_c.result()
+            except Exception:
+                claude_off = None
+        try:
+            gemini_off = fut_g.result()
+        except Exception:
+            gemini_off = None
+    if claude_cache_sub.get("claude_official_usage_v1") is not None:
+        cache["claude_official_usage_v1"] = claude_cache_sub["claude_official_usage_v1"]
+    if gemini_cache_sub.get("gemini_official_usage_v1") is not None:
+        cache["gemini_official_usage_v1"] = gemini_cache_sub["gemini_official_usage_v1"]
+
     items = [
-        collect_claude(now, aos, cache, cfg),
+        collect_claude(now, aos, cache, cfg, force_probe=force_refresh, official_override=claude_off),
         collect_codex(now, cache),
-        collect_gemini(now, cfg, cache, force_plan=('--refresh-plan' in sys.argv)),
-        collect_opencode(now, aos, cfg),
+        collect_gemini(now, cfg, cache, force_plan=force_refresh, official_override=gemini_off),
+        collect_opencode(now, aos, cfg, cache),
     ] + collect_custom(cfg)
     save_cache(cache)
     present = {
