@@ -77,8 +77,11 @@ local items = {
   placeholder("gemini", "Gemini"),
   placeholder("opencode", "OpenCode"),
 }
--- 各AIで今選んでいるビューの番号（1 = 一番時間軸が小さい初期表示）
-local viewIdx = { claude = 1, codex = 1, gemini = 1, opencode = 1 }
+-- 各AIで共通の現在スロット（1:5時間 -> 2:週間 -> 3:月間 -> 4:その他。クリックで全AI一斉切替）
+local SLOT_ORDER = { "5h", "week", "month", "extra" }
+local globalSlot = "5h"
+local globalStep = 1
+local viewOverride = {} -- shift+クリックで個別切替したときだけ使う
 
 local notch = hs.canvas.new({ x = 0, y = 0, w = REST_W, h = H + 20 })
 local tip = hs.canvas.new({ x = 0, y = 0, w = 10, h = 10 })
@@ -110,13 +113,38 @@ local function statusColor(st)
   else return GRAY end
 end
 
+local function availableSlots()
+  local has = {}
+  for _, it in ipairs(items) do
+    if type(it.views) == "table" then
+      for _, v in ipairs(it.views) do
+        local sl = v.slot or v.key
+        if sl then has[sl] = true end
+      end
+    end
+  end
+  local out = {}
+  for _, s in ipairs(SLOT_ORDER) do
+    if has[s] then table.insert(out, s) end
+  end
+  return out
+end
+
 local function activeView(it)
   local vs = it.views
   if type(vs) ~= "table" or #vs == 0 then
     return { sub = "", mode = "percent", percent = nil, center = "--", status = "none", tip1 = it.label, tip2 = "" }
   end
-  local idx = viewIdx[it.id] or 1
-  if idx < 1 or idx > #vs then idx = 1; viewIdx[it.id] = 1 end
+  local ov = viewOverride[it.id]
+  if ov and ov >= 1 and ov <= #vs then
+    return vs[ov]
+  end
+  for _, v in ipairs(vs) do
+    if (v.slot or v.key) == globalSlot then
+      return v
+    end
+  end
+  local idx = ((globalStep - 1) % #vs) + 1
   return vs[idx]
 end
 
@@ -574,7 +602,7 @@ local function openMenu()
         table.insert(sub, { title = "   " .. ((v.sub and v.sub ~= "") and v.sub or v.key), checked = on, fn = function()
           prefs.hiddenViews[it.id] = prefs.hiddenViews[it.id] or {}
           prefs.hiddenViews[it.id][v.key] = on and true or nil
-          viewIdx[it.id] = 1
+          viewOverride[it.id] = nil
           changed()
         end })
       end
@@ -628,7 +656,9 @@ local function openMenu()
   end })
   table.insert(m, { title = L("表示を最初に戻す", "Reset what is shown"), fn = function()
     prefs = blankPrefs()
-    for k in pairs(viewIdx) do viewIdx[k] = 1 end
+    globalSlot = "5h"
+    globalStep = 1
+    viewOverride = {}
     changed()
   end })
   table.insert(m, { title = L("今すぐ新しくする", "Refresh now"), fn = function() refresh(true, true) end })
@@ -641,24 +671,45 @@ local function openMenu()
   menuBar:popupMenu(pt)
 end
 
--- クリック: そのAIの時間軸を次へ切替。option+クリックで今すぐ最新値に更新。「•••」か ctrl+クリックで表示するものを選ぶ
+-- クリック: すべてのAIの時間軸を一斉に次へ切替（5時間 → 週間 → 月間 → その他）。shift+クリックでそのAIだけ個別切替。option+クリックで今すぐ最新値に更新。「•••」か ctrl+クリックで設定
 local function click(id)
   if not id or id == "body" then return end
-  if id == "gear" or hs.eventtap.checkKeyboardModifiers().ctrl then
+  local mods = hs.eventtap.checkKeyboardModifiers()
+  if id == "gear" or mods.ctrl then
     hs.timer.doAfter(0, openMenu)
     return
   end
-  if hs.eventtap.checkKeyboardModifiers().alt then
+  if mods.alt then
     refresh(true, true)
     return
   end
   local _, it = itemCy(id)
-  if not it or type(it.views) ~= "table" or #it.views <= 1 then
-    refresh(true)
-    return
+  if mods.shift then
+    if not it or type(it.views) ~= "table" or #it.views <= 1 then
+      refresh(true)
+      return
+    end
+    local curIdx = viewOverride[id]
+    if not curIdx then
+      local curV = activeView(it)
+      for i, v in ipairs(it.views) do if v == curV then curIdx = i; break end end
+    end
+    viewOverride[id] = ((curIdx or 1) % #it.views) + 1
+  else
+    viewOverride = {}
+    local slots = availableSlots()
+    if #slots > 1 then
+      local curPos = 1
+      for i, s in ipairs(slots) do if s == globalSlot then curPos = i; break end end
+      globalSlot = slots[(curPos % #slots) + 1]
+      globalStep = globalStep + 1
+    elseif it and type(it.views) == "table" and #it.views > 1 then
+      globalStep = globalStep + 1
+    else
+      refresh(true)
+      return
+    end
   end
-  local cur = viewIdx[id] or 1
-  viewIdx[id] = (cur % #it.views) + 1
   draw()
   if mode == "docked" and width >= OPEN_W * 0.8 then
     activeHoverId = id
@@ -820,6 +871,8 @@ refresh(true)
 M.refresh = function() refresh(true) end
 M.peek = peek
 M.cycle = click
+M.slot = function() return globalSlot end
+M.setSlot = function(s) globalSlot = s; viewOverride = {}; draw() end
 M.items = function() return items end
 M.frame = function() return notch:frame() end
 M.debugShowTip = showTipForId
